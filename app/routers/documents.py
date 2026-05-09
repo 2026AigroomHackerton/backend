@@ -19,7 +19,7 @@ API 공통 규칙(명세서 기준):
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, UploadFile, status
+from fastapi import APIRouter, File, Form, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ from app.services.document_service import (
     DocumentNotFoundError,
     EmptyFileError,
     FileTooLargeError,
+    InvalidSourceTypeError,
     UnsupportedFileTypeError,
 )
 
@@ -101,25 +102,29 @@ def _error_response(message: str, code: str, status_code: int) -> JSONResponse:
 @router.post("/upload")
 async def upload_document(
     file: UploadFile | None = File(default=None),
+    source_type: str = Form(default="upload"),
 ) -> JSONResponse:
     """
-    문서 업로드 엔드포인트.
+    문서 업로드 엔드포인트 (명세 7.1).
 
     클라이언트는 multipart/form-data 형식으로 `file` 필드에 파일을 담아 전송한다.
-    서버는 다음 작업을 수행한다.
-        1. 파일이 첨부되었는지 확인
+    `source_type` 폼 필드를 함께 보내 어떤 경로로 업로드되었는지 식별한다.
+
+    서버 처리 순서:
+        1. 파일이 첨부되었는지 확인 (없으면 400)
         2. 서비스 계층에 위임하여 파일 저장 + DB 메타데이터 기록
         3. 결과를 명세 형식으로 감싸 응답
-            - 성공: 201 Created + {"success": true, "data": <메타데이터>}
-            - 실패: 4xx/5xx + {"success": false, "data": {"code": ..., "message": ...}}
 
     Args:
-        file: 업로드된 파일.
-            `File(default=None)` 으로 두어 누락 시 FastAPI 의 기본 422 검증 응답이 아니라
-            라우터 내부에서 명세 형식으로 400 에러를 반환할 수 있게 한다.
+        file: 업로드된 파일. `File(default=None)` 으로 두어 누락 시 FastAPI 의
+            기본 422 검증 응답이 아니라 라우터 내부에서 명세 형식의 400 에러로 변환.
+        source_type: 업로드 경로 식별자. 기본값 "upload".
+            허용 값: "upload" | "camera" | "archive".
+            (검증은 service 계층에서 수행 — InvalidSourceTypeError 로 통일)
 
     Returns:
-        명세 형식의 JSONResponse.
+        - 201 + {"success": true, "data": {...}}: 정상
+        - 400/413/500 + 명세 형식 에러: 실패
     """
 
     # ---- 파일 누락 방어 ----
@@ -135,13 +140,20 @@ async def upload_document(
     # ---- 비즈니스 로직 위임 + 도메인 예외 변환 ----
     try:
         document = await document_service.upload_document(
-            file=file, user_id=DEMO_USER_ID
+            file=file, user_id=DEMO_USER_ID, source_type=source_type
         )
     except UnsupportedFileTypeError as exc:
         # 클라이언트의 잘못된 입력 → 400 Bad Request
         return _error_response(
             message=str(exc),
             code="UNSUPPORTED_FILE_TYPE",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    except InvalidSourceTypeError as exc:
+        # source_type 값이 화이트리스트에 없을 때.
+        return _error_response(
+            message=str(exc),
+            code="INVALID_SOURCE_TYPE",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     except EmptyFileError as exc:

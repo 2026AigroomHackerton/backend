@@ -50,6 +50,14 @@ ALLOWED_EXTENSIONS: Final[frozenset[str]] = frozenset(
     {".hwpx", ".hwp", ".png", ".jpg", ".jpeg"}
 )
 
+# 허용 source_type 값 (명세 7.1).
+#   - "upload":  파일 업로더로 직접 업로드한 경우 (기본값)
+#   - "camera":  모바일 카메라로 직접 촬영한 경우
+#   - "archive": 외부 아카이브/연동 서비스에서 가져온 경우
+ALLOWED_SOURCE_TYPES: Final[frozenset[str]] = frozenset(
+    {"upload", "camera", "archive"}
+)
+
 # 업로드 가능한 최대 파일 크기 (바이트). 100MB.
 # 모바일에서 찍은 고해상도 이미지가 들어올 수 있으므로 여유 있게 잡는다.
 MAX_FILE_SIZE: Final[int] = 100 * 1024 * 1024
@@ -79,6 +87,10 @@ class EmptyFileError(ValueError):
 
 class FileTooLargeError(ValueError):
     """파일 크기가 MAX_FILE_SIZE 를 초과했을 때 발생."""
+
+
+class InvalidSourceTypeError(ValueError):
+    """source_type 값이 ALLOWED_SOURCE_TYPES 에 없을 때 발생."""
 
 
 # ---------------------------------------------------------------------------
@@ -231,22 +243,42 @@ def _connect() -> Iterator[sqlite3.Connection]:
 # ---------------------------------------------------------------------------
 # 메인 비즈니스 함수
 # ---------------------------------------------------------------------------
-async def upload_document(file: UploadFile, user_id: int) -> dict:
+async def upload_document(
+    file: UploadFile,
+    user_id: int,
+    source_type: str = "upload",
+) -> dict:
     """
     업로드된 파일을 검증·저장하고 DB 레코드를 만든 뒤 메타데이터를 반환한다.
 
     Args:
         file: FastAPI 가 멀티파트 폼에서 추출한 UploadFile.
         user_id: 데모 사용자 식별자 (해커톤 MVP 에서는 라우터에서 1 을 고정 주입).
+        source_type: 문서가 어떤 경로로 들어왔는지 표시.
+            - "upload" (기본값): 파일 업로더로 직접 업로드
+            - "camera":  카메라로 촬영
+            - "archive": 외부 아카이브 연동
+            허용 외 값이면 InvalidSourceTypeError 를 발생시킨다.
 
     Returns:
-        생성된 문서 메타데이터 dict. 라우터는 이를 그대로 응답 `data` 필드에 넣는다.
+        생성된 문서의 응답용 메타데이터 dict (명세서 13절).
+        필드: id, title, source_type, file_type, parse_status, created_at
 
     Raises:
         UnsupportedFileTypeError: 확장자가 허용 목록에 없을 때.
         EmptyFileError: 파일 크기가 0 일 때.
         FileTooLargeError: 파일 크기가 MAX_FILE_SIZE 초과일 때.
+        InvalidSourceTypeError: source_type 이 ALLOWED_SOURCE_TYPES 에 없을 때.
     """
+
+    # ---- 0단계: source_type 검증 ----
+    # 라우터에서 Form 으로 받은 값이 화이트리스트에 있는지 확인.
+    # 클라이언트 오타나 임의 값 차단 목적.
+    if source_type not in ALLOWED_SOURCE_TYPES:
+        raise InvalidSourceTypeError(
+            f"지원하지 않는 source_type 입니다: '{source_type}'. "
+            f"허용 값: {sorted(ALLOWED_SOURCE_TYPES)}"
+        )
 
     # ---- 1단계: 파일명/확장자 검증 ----
     # `file.filename` 은 클라이언트가 보낸 원본 이름. 누락 시 'unnamed' 로 대체.
@@ -291,13 +323,19 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
     # ISO 8601 + UTC 타임존으로 생성 시각 기록 → 클라이언트에서 파싱 용이.
     created_at = datetime.now(timezone.utc).isoformat()
 
+    # documents 테이블에는 별도 title 컬럼이 있으나(_init_db 에서 추가됨),
+    # 본 단계에서는 OCR/AI 가 아직 동작하지 않으므로 사용자에게 보일 임시 title 로
+    # original_filename 을 그대로 채워 넣는다. (TODO: OCR/AI 단계에서 의미 있는 제목으로 갱신)
+    title_fallback = original_filename
+
     with _connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO documents (
                 user_id, original_filename, stored_filename, file_path,
-                file_extension, file_size, content_type, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                file_extension, file_size, content_type, title,
+                source_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -307,6 +345,8 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
                 extension,
                 file_size,
                 file.content_type,
+                title_fallback,
+                source_type,
                 created_at,
             ),
         )
@@ -318,17 +358,17 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
         assert cursor.lastrowid is not None, "INSERT 직후 lastrowid 는 항상 존재해야 합니다."
         document_id = cursor.lastrowid
 
-    # ---- 5단계: 응답용 메타데이터 반환 ----
-    # 라우터는 이 dict 를 `{"success": True, "data": <dict>}` 로 감싸 응답한다.
+    # ---- 5단계: 응답용 메타데이터 반환 (명세서 13절) ----
+    # 클라이언트가 알 필요 없는 내부 구현 정보(stored_filename, file_path,
+    # file_size, content_type, user_id) 는 응답에서 제거.
+    # parse_status 는 이제 막 INSERT 한 행의 기본값과 동일한 "pending" 으로 하드코딩.
+    # (DB DEFAULT 와 일치하므로 별도 SELECT 불필요.)
     return {
         "id": document_id,
-        "user_id": user_id,
-        "original_filename": original_filename,
-        "stored_filename": stored_filename,
-        "file_path": relative_path,
-        "file_extension": extension,
-        "file_size": file_size,
-        "content_type": file.content_type,
+        "title": title_fallback,
+        "source_type": source_type,
+        "file_type": extension,
+        "parse_status": "pending",
         "created_at": created_at,
     }
 
@@ -375,6 +415,42 @@ def list_documents(user_id: int) -> list[dict]:
             "source_type": row["source_type"],
             "file_type": row["file_extension"],
             "parse_status": row["parse_status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def list_archive_documents(user_id: int) -> list[dict]:
+    """
+    아카이브 화면용 문서 목록을 반환한다.
+
+    `list_documents` 와 별도로 분리한 이유:
+        - 아카이브 화면은 folder_id 별로 그룹핑이 필요하므로 folder_id 가 응답 필드에 포함되어야 함
+        - `list_documents` 의 응답에는 folder_id 가 없어 이 화면 요구를 만족하지 못함
+        - 즉, "어떤 화면이 어떤 필드를 필요로 하는가" 가 다르므로 view-model 단위로 함수 분리
+
+    응답 필드 (각 dict):
+        - folder_id: 폴더 그룹핑 키 (NULL 가능 — 미분류)
+        - id, title, source_type, created_at, updated_at: 카드 표시용 핵심 필드
+
+    Args:
+        user_id: 데모 사용자 식별자.
+
+    Returns:
+        활성 문서들의 dict 리스트.
+        호출자(archive 라우터)는 본 결과를 folder_id 로 그룹핑해 응답을 구성한다.
+    """
+    from app.repositories import document_repository  # 지연 import
+
+    rows = document_repository.list_active_documents_by_user(user_id=user_id)
+    return [
+        {
+            "folder_id": row["folder_id"],
+            "id": row["id"],
+            "title": row["title"],
+            "source_type": row["source_type"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

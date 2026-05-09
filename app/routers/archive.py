@@ -13,11 +13,9 @@ API 공통 규칙:
     - 인증은 해커톤 MVP 단계에서 생략, `user_id=1` 데모 사용자 고정
 
 아키텍처 메모:
-    - 본래 router → service → repository 순으로 호출이 흘러야 하지만,
-      `document_service.list_documents` 응답은 folder_id 를 누락한 채 매핑된 카드만 돌려주므로
-      그룹핑을 위해 본 라우터에서는 예외적으로 `document_repository` 를 직접 호출한다.
-      service / repository 파일 수정이 금지된 본 작업의 제약 하에서 가장 깔끔한 절충안.
-      (TODO: 추후 service 에 `list_documents_with_folder` 같은 함수가 생기면 거기로 옮길 것)
+    - router → service → repository 호출 흐름을 준수한다.
+    - 본 라우터는 `document_service.list_archive_documents` 만 호출하며,
+      DB 쿼리는 service 가 다시 repository 로 위임한다.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from typing import Any, Final
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
-from app.repositories import document_repository
+from app.services import document_service
 
 # ---------------------------------------------------------------------------
 # 데모 사용자 ID
@@ -173,12 +171,11 @@ async def get_archive() -> JSONResponse:
         - 200 + {"success": true, "data": {"local": [...], "external": [...]}}: 정상
         - 500 + 명세 형식 에러: 예기치 못한 오류
     """
-    # ---- 1) DB 조회 ----
-    # repository 가 deleted_at IS NULL 필터를 이미 적용해 활성 문서만 돌려준다.
+    # ---- 1) 서비스 호출 ----
+    # 아키텍처 규칙: router 는 service 만 호출, DB 접근은 service 가 repository 에 위임.
+    # service 가 folder_id 를 포함한 카드용 dict 리스트를 돌려준다.
     try:
-        rows = document_repository.list_active_documents_by_user(
-            user_id=DEMO_USER_ID
-        )
+        rows = document_service.list_archive_documents(user_id=DEMO_USER_ID)
     except Exception as exc:  # noqa: BLE001
         # 운영에서는 여기서 로깅. MVP 라 메시지만 회피적으로 노출.
         return _error_response(
