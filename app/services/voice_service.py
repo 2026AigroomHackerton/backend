@@ -236,6 +236,16 @@ class VoiceService:
             {voice_command_id, document_id, transcript, input_type,
              audio_path, status, created_at} 의 dict.
         """
+        # TODO: models.py에 아래 테이블 추가 필요 (팀장에게 요청):
+        # - ocr_sources: id, document_id, image_path, raw_text, cleaned_text, confidence, created_at
+        # - voice_commands: id, document_id, transcript, input_type, audio_path, status, created_at
+        # - documents: id, owner_type, owner_id, title, source_type, file_type, parse_status, created_at
+        # - document_texts: id, document_id, extracted_text, text_version, updated_at
+        # 위 테이블이 추가되면 본 메서드 본문을 다음과 같이 교체:
+        #     vc = VoiceCommand(document_id=..., transcript=..., input_type=...,
+        #                       audio_path=..., status="received")
+        #     db.add(vc); db.commit(); db.refresh(vc)
+        #     return {... vc.id ...}
         record: dict[str, Any] = {
             "voice_command_id": self.generate_command_id(),
             "document_id": document_id,
@@ -267,6 +277,16 @@ class VoiceService:
         Returns:
             저장된 record dict 의 리스트. 없으면 빈 리스트.
         """
+        # TODO: models.py에 아래 테이블 추가 필요 (팀장에게 요청):
+        # - ocr_sources: id, document_id, image_path, raw_text, cleaned_text, confidence, created_at
+        # - voice_commands: id, document_id, transcript, input_type, audio_path, status, created_at
+        # - documents: id, owner_type, owner_id, title, source_type, file_type, parse_status, created_at
+        # - document_texts: id, document_id, extracted_text, text_version, updated_at
+        # 위 테이블이 추가되면 본 메서드 본문을 다음과 같이 교체:
+        #     return (db.query(VoiceCommand)
+        #               .filter(VoiceCommand.document_id == document_id)
+        #               .order_by(VoiceCommand.created_at.desc())
+        #               .all())
         # 동일 document_id 인 레코드만 필터.
         # 정렬은 created_at 내림차순 (최신순).
         items = [

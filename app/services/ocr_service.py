@@ -328,9 +328,18 @@ class OcrService:
     ) -> None:
         """라우터가 extract 종료 시 호출. 이후 GET/confirm 에서 조회 가능.
 
-        TODO(실제 DB 연동):
-            ocr_sources 테이블에 raw_text/image_path INSERT.
+        역할: save_ocr_result() 에 해당. ocr_sources 테이블 INSERT 자리.
         """
+        # TODO: models.py에 아래 테이블 추가 필요 (팀장에게 요청):
+        # - ocr_sources: id, document_id, image_path, raw_text, cleaned_text, confidence, created_at
+        # - voice_commands: id, document_id, transcript, input_type, audio_path, status, created_at
+        # - documents: id, owner_type, owner_id, title, source_type, file_type, parse_status, created_at
+        # - document_texts: id, document_id, extracted_text, text_version, updated_at
+        # 위 테이블이 추가되면 본 메서드 본문을 다음과 같이 교체:
+        #     src = OcrSource(document_id=None, image_path=image_path,
+        #                     raw_text=extracted_text, cleaned_text=extracted_text,
+        #                     confidence=...)
+        #     db.add(src); db.commit(); db.refresh(src)
         self._store[ocr_source_id] = {
             "ocr_source_id": ocr_source_id,
             "raw_text": extracted_text,
@@ -343,14 +352,20 @@ class OcrService:
     # GET /api/ocr/{ocr_source_id}
     # =========================================================================
     def get_result(self, ocr_source_id: str) -> dict[str, Any]:
-        """OCR 결과를 단건 조회.
-
-        TODO(실제 DB 연동):
-            ocr_sources 에서 ocr_source_id 로 SELECT.
+        """OCR 결과를 단건 조회 (= get_ocr_result()).
 
         Raises:
             OcrSourceNotFoundError: 미등록 ID.
         """
+        # TODO: models.py에 아래 테이블 추가 필요 (팀장에게 요청):
+        # - ocr_sources: id, document_id, image_path, raw_text, cleaned_text, confidence, created_at
+        # - voice_commands: id, document_id, transcript, input_type, audio_path, status, created_at
+        # - documents: id, owner_type, owner_id, title, source_type, file_type, parse_status, created_at
+        # - document_texts: id, document_id, extracted_text, text_version, updated_at
+        # 위 테이블이 추가되면 본 메서드 본문을 다음과 같이 교체:
+        #     return (db.query(OcrSource)
+        #               .filter(OcrSource.id == ocr_source_id)
+        #               .first())
         record = self._store.get(ocr_source_id)
         if record is None:
             raise OcrSourceNotFoundError(
@@ -370,14 +385,22 @@ class OcrService:
     def confirm_result(
         self, ocr_source_id: str, edited_text: str
     ) -> dict[str, Any]:
-        """사용자 수정본을 확정 상태로 저장.
-
-        TODO(실제 DB 연동):
-            ocr_sources.cleaned_text=edited_text, status='confirmed' UPDATE.
+        """사용자 수정본을 확정 상태로 저장 (= update_cleaned_text()).
 
         Raises:
             OcrSourceNotFoundError: 미등록 ID.
         """
+        # TODO: models.py에 아래 테이블 추가 필요 (팀장에게 요청):
+        # - ocr_sources: id, document_id, image_path, raw_text, cleaned_text, confidence, created_at
+        # - voice_commands: id, document_id, transcript, input_type, audio_path, status, created_at
+        # - documents: id, owner_type, owner_id, title, source_type, file_type, parse_status, created_at
+        # - document_texts: id, document_id, extracted_text, text_version, updated_at
+        # 위 테이블이 추가되면 본 메서드 본문을 다음과 같이 교체:
+        #     src = (db.query(OcrSource)
+        #              .filter(OcrSource.id == ocr_source_id).first())
+        #     if not src: raise OcrSourceNotFoundError(...)
+        #     src.cleaned_text = edited_text
+        #     db.commit()
         record = self._store.get(ocr_source_id)
         if record is None:
             raise OcrSourceNotFoundError(

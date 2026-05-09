@@ -120,7 +120,16 @@ class VoiceCommandCreate(BaseModel):
 # =============================================================================
 # ① POST /api/voice/transcribe — 음성 → 텍스트 (+ DB 저장)
 # =============================================================================
-@router.post("/transcribe", status_code=status.HTTP_200_OK, response_model=ApiResponse)
+@router.post(
+    "/transcribe",
+    status_code=status.HTTP_200_OK,
+    response_model=ApiResponse,
+    summary="음성 파일 STT 변환",
+    description=(
+        "오디오 파일을 OpenAI Whisper API로 실제 음성 인식합니다. "
+        "환경변수 OPENAI_API_KEY 필요. 한국어 인식(language=ko)."
+    ),
+)
 async def transcribe_voice(
     # multipart/form-data 의 file 파트.
     audio: UploadFile = File(..., description="음성 파일 (mp3/m4a/wav/webm/ogg/flac)"),
@@ -208,7 +217,15 @@ async def transcribe_voice(
 # =============================================================================
 # ② POST /api/voice/commands — 텍스트/오디오 명령 직접 저장
 # =============================================================================
-@router.post("/commands", response_model=ApiResponse)
+@router.post(
+    "/commands",
+    response_model=ApiResponse,
+    summary="텍스트 명령 저장 (Web Speech API fallback)",
+    description=(
+        "브라우저 Web Speech API로 이미 변환된 텍스트 명령을 서버에 저장합니다. "
+        "Whisper를 거치지 않고 직접 텍스트로 입력하는 fallback 엔드포인트."
+    ),
+)
 async def create_command(payload: VoiceCommandCreate) -> dict[str, Any]:
     """음성/텍스트 명령을 voice_commands 에 직접 저장한다.
 
@@ -239,7 +256,12 @@ async def create_command(payload: VoiceCommandCreate) -> dict[str, Any]:
 # =============================================================================
 # ③ GET /api/voice/commands — 특정 문서의 명령 이력 조회
 # =============================================================================
-@router.get("/commands", response_model=ApiResponse)
+@router.get(
+    "/commands",
+    response_model=ApiResponse,
+    summary="문서별 명령 이력 조회",
+    description="document_id 기준으로 해당 문서의 전체 명령 이력을 조회합니다.",
+)
 async def list_commands(
     document_id: str = Query(..., description="조회할 문서 ID"),
 ) -> dict[str, Any]:
