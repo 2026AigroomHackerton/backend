@@ -154,3 +154,205 @@ def get_document_with_latest_text(
             text_row["extracted_text"] if text_row is not None else None
         )
         return result
+
+
+# ---------------------------------------------------------------------------
+# 텍스트 수정/버전 기록 관련 쿼리 (PUT /api/documents/{id}/text)
+# ---------------------------------------------------------------------------
+def document_exists_for_user(document_id: int, user_id: int) -> bool:
+    """
+    해당 문서가 존재하고, 지정 사용자의 소유이며, soft-delete 되지 않았는지 확인한다.
+
+    소유권/존재 검증을 분리해 service 가 NotFound 분기에 사용한다.
+    `SELECT 1` 로 단일 컬럼만 가져와 비용을 최소화.
+
+    Args:
+        document_id: 검사할 문서 PK.
+        user_id: 소유자 식별자.
+
+    Returns:
+        조건을 모두 만족하는 행이 있으면 True, 없으면 False.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM documents
+            WHERE id = ?
+              AND user_id = ?
+              AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            (document_id, user_id),
+        ).fetchone()
+        return row is not None
+
+
+def find_document_text_id(document_id: int) -> Optional[int]:
+    """
+    document_texts 에서 해당 document_id 의 가장 최신 행 id 를 찾는다.
+
+    비고: 본 프로젝트는 document_texts 를 1 행만 유지(현재 텍스트 상태)하고,
+    누적 이력은 document_versions 에서 관리한다.
+    그래도 안전하게 LIMIT 1 + ORDER BY id DESC 로 최신 행을 선택한다.
+
+    Returns:
+        해당 행이 있으면 그 id, 없으면 None.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM document_texts
+            WHERE document_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+
+def insert_document_text(
+    document_id: int,
+    extracted_text: str,
+    text_version: int,
+    updated_at: str,
+) -> int:
+    """
+    document_texts 에 새 행을 INSERT 하고 발급된 PK 를 반환한다.
+
+    `find_document_text_id` 가 None 일 때(즉, 아직 텍스트가 한 번도 저장되지 않은 문서)에 사용한다.
+    extracted_text/cleaned_text/summary/keywords 중 본 작업에서 의미 있는 값은
+    `extracted_text` 뿐이며, 나머지는 후속 OCR/AI 단계에서 채운다.
+
+    Args:
+        document_id: documents.id
+        extracted_text: 사용자가 수정/입력한 텍스트
+        text_version: 함께 기록할 현재 텍스트 버전 (= document_versions.version_no 와 동기화)
+        updated_at: ISO-8601 UTC 시각 문자열
+
+    Returns:
+        새로 INSERT 된 document_texts.id
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO document_texts (
+                document_id, extracted_text, text_version, updated_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (document_id, extracted_text, text_version, updated_at),
+        )
+        conn.commit()
+        # AUTOINCREMENT 로 발급된 새 PK.
+        # sqlite3 타입 스텁상 lastrowid 는 `int | None` 이라 그냥 반환하면
+        # Pylance 가 호출자 시그니처(int)와 불일치한다고 경고한다.
+        # INSERT 직후 None 일 수 없으므로 assert 로 타입을 좁혀 Pylance 에 보장한다.
+        assert cursor.lastrowid is not None, "INSERT 직후 lastrowid 는 항상 존재해야 합니다."
+        return cursor.lastrowid
+
+
+def update_document_text(
+    text_id: int,
+    extracted_text: str,
+    text_version: int,
+    updated_at: str,
+) -> None:
+    """
+    이미 존재하는 document_texts 행을 새 텍스트로 갱신한다.
+
+    Args:
+        text_id: document_texts.id (find_document_text_id 결과)
+        extracted_text: 새 텍스트 본문
+        text_version: 갱신 후 텍스트 버전
+        updated_at: ISO-8601 UTC 시각 문자열
+    """
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE document_texts
+            SET extracted_text = ?,
+                text_version = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (extracted_text, text_version, updated_at, text_id),
+        )
+        conn.commit()
+
+
+def get_max_version_no(document_id: int) -> int:
+    """
+    해당 document_id 의 document_versions 중 가장 큰 version_no 를 반환한다.
+
+    이력 행이 하나도 없을 수 있으므로 COALESCE 로 0 을 기본값으로 강제한다.
+    호출자(service)는 반환값에 +1 을 해서 새 version_no 를 만든다.
+
+    Returns:
+        가장 큰 version_no 또는 0 (이력 없음).
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(MAX(version_no), 0) AS max_version
+            FROM document_versions
+            WHERE document_id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        # row 는 항상 1행 (집계 함수)이며, max_version 은 정수.
+        return int(row["max_version"])
+
+
+def insert_document_version(
+    document_id: int,
+    version_no: int,
+    text_snapshot: str,
+    created_by: int,
+    created_at: str,
+) -> int:
+    """
+    document_versions 에 새 버전 이력을 한 행 추가하고 발급된 PK 를 반환한다.
+
+    Args:
+        document_id: 대상 문서 PK
+        version_no: 신규 부여할 단조 증가 버전 번호 (service 가 max+1 로 계산)
+        text_snapshot: 그 시점의 텍스트 전문 스냅샷
+        created_by: 수정한 사용자 식별자 (데모는 1)
+        created_at: ISO-8601 UTC 시각 문자열
+
+    Returns:
+        새로 INSERT 된 document_versions.id
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO document_versions (
+                document_id, version_no, text_snapshot, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (document_id, version_no, text_snapshot, created_by, created_at),
+        )
+        conn.commit()
+        # 위와 같은 이유로 assert 후 반환 (Pylance 타입 narrowing).
+        assert cursor.lastrowid is not None, "INSERT 직후 lastrowid 는 항상 존재해야 합니다."
+        return cursor.lastrowid
+
+
+def update_document_updated_at(document_id: int, updated_at: str) -> None:
+    """
+    documents 테이블의 updated_at 을 갱신한다.
+
+    이 함수는 호출자(service)가 다른 모든 쓰기 작업이 끝난 뒤 마지막에 호출한다.
+
+    Args:
+        document_id: documents.id
+        updated_at: ISO-8601 UTC 시각 문자열
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE documents SET updated_at = ? WHERE id = ?",
+            (updated_at, document_id),
+        )
+        conn.commit()

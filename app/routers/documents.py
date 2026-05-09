@@ -19,7 +19,7 @@ API 공통 규칙(명세서 기준):
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, UploadFile, status
+from fastapi import APIRouter, File, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from app.services import document_service
@@ -240,3 +240,95 @@ async def get_document(document_id: int) -> JSONResponse:
         )
 
     return _success_response(document, status_code=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# 엔드포인트: 문서 텍스트 수정 (버전 이력 기록)
+# ---------------------------------------------------------------------------
+# JSON 본문을 직접 파싱하는 이유:
+#   - Pydantic BaseModel 로 검증하면 누락 시 FastAPI 가 422 + {"detail": [...]} 형식으로 자동 응답.
+#   - 명세는 "응답 항상 {success, data} 구조" 를 요구하므로 본문 검증도 라우터에서 직접 처리.
+@router.put("/{document_id}/text")
+async def update_document_text(
+    document_id: int, request: Request
+) -> JSONResponse:
+    """
+    문서 본문 텍스트를 수정한다.
+
+    요청:
+        PUT /api/documents/{document_id}/text
+        Body: {"edited_text": "수정된 문서 텍스트"}
+
+    처리:
+        1) 본문 JSON 파싱/검증 (raw 파싱 — 422 명세 위반 회피)
+        2) service.update_document_text 호출 → DB 4단계 작업 위임
+        3) 결과를 명세 형식으로 감싸 응답
+
+    응답 data:
+        - document_text_id, version_id, version_no, updated_at
+
+    상태 코드:
+        - 200: 성공
+        - 400: 잘못된 본문 (JSON 파싱 실패, edited_text 누락/타입 오류)
+        - 404: 문서 없음/소유권 불일치/삭제됨
+        - 500: 예기치 못한 서버 오류
+    """
+
+    # ---- 1) JSON 본문 파싱 ----
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        # JSON 파싱 자체 실패 — Content-Type 누락이나 본문 깨짐 등.
+        return _error_response(
+            message="유효한 JSON 본문이 필요합니다.",
+            code="INVALID_JSON",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # body 가 dict 가 아니면 (예: 리스트, 숫자) 잘못된 요청.
+    if not isinstance(body, dict):
+        return _error_response(
+            message="요청 본문은 JSON 객체여야 합니다.",
+            code="INVALID_BODY",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # ---- 2) edited_text 필드 검증 ----
+    if "edited_text" not in body:
+        return _error_response(
+            message="edited_text 필드가 누락되었습니다.",
+            code="MISSING_EDITED_TEXT",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    edited_text = body["edited_text"]
+    if not isinstance(edited_text, str):
+        return _error_response(
+            message="edited_text 는 문자열이어야 합니다.",
+            code="INVALID_EDITED_TEXT",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # ---- 3) 비즈니스 로직 위임 ----
+    try:
+        result = document_service.update_document_text(
+            document_id=document_id,
+            edited_text=edited_text,
+            user_id=DEMO_USER_ID,
+            created_by=DEMO_USER_ID,
+        )
+    except DocumentNotFoundError as exc:
+        return _error_response(
+            message=str(exc),
+            code="DOCUMENT_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"문서 텍스트 수정 중 오류가 발생했습니다: {exc}",
+            code="INTERNAL_SERVER_ERROR",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    # ---- 4) 성공 응답 ----
+    return _success_response(result, status_code=status.HTTP_200_OK)

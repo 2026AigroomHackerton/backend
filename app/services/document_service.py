@@ -173,6 +173,31 @@ def _init_db() -> None:
             "ON document_texts(document_id)"
         )
 
+        # ---- 4) document_versions 신규 테이블 ----
+        # 문서 텍스트가 변경될 때마다 한 행씩 누적되는 버전 이력 테이블.
+        # version_no 는 해당 document_id 안에서만 의미 있는 단조 증가 정수.
+        # text_snapshot 은 그 시점의 텍스트 전문(스냅샷)을 보관해 롤백/diff 용도로 쓴다.
+        # created_by 는 누가 수정했는지 (현재는 데모 사용자 1).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL,
+                text_snapshot TEXT,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (document_id) REFERENCES documents(id)
+            )
+            """
+        )
+
+        # 가장 최근 version_no 를 빠르게 찾기 위해 (document_id, version_no) 복합 인덱스 추가.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_document_versions_doc_ver "
+            "ON document_versions(document_id, version_no)"
+        )
+
         conn.commit()
 
 
@@ -287,6 +312,10 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
         )
         conn.commit()
         # AUTOINCREMENT 로 발급된 새 PK.
+        # sqlite3 타입 스텁상 lastrowid 는 `int | None` 이라 그대로 쓰면
+        # Pylance 가 응답 dict 의 id 필드 타입을 'int | None' 으로 추론해 경고한다.
+        # INSERT 직후엔 None 이 나올 수 없으므로 assert 로 타입을 좁힌다.
+        assert cursor.lastrowid is not None, "INSERT 직후 lastrowid 는 항상 존재해야 합니다."
         document_id = cursor.lastrowid
 
     # ---- 5단계: 응답용 메타데이터 반환 ----
@@ -389,4 +418,107 @@ def get_document(document_id: int, user_id: int) -> dict:
         "updated_at": row["updated_at"],
         # document_texts 가 없으면 None 으로 통일 (명세 요구사항).
         "extracted_text": row.get("extracted_text"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 텍스트 수정 서비스 함수 (PUT /api/documents/{id}/text)
+# ---------------------------------------------------------------------------
+def update_document_text(
+    document_id: int,
+    edited_text: str,
+    user_id: int,
+    created_by: int,
+) -> dict:
+    """
+    문서 본문 텍스트를 수정하고, 새 버전 이력을 기록한 뒤 결과를 반환한다.
+
+    처리 순서 (명세 정의):
+        1) document_id + user_id 로 문서 존재 검증, 없으면 DocumentNotFoundError.
+        2) document_versions 의 max(version_no) + 1 로 새 version_no 계산.
+        3) document_texts 가 이미 있으면 UPDATE, 없으면 INSERT (text_version 도 함께 동기화).
+        4) document_versions 에 새 버전 이력 한 행 INSERT.
+        5) documents.updated_at 갱신.
+
+    각 단계는 repository 함수 한 번 호출에 대응하여, 본 함수는 순서·분기 로직만 담당한다.
+    SQLite 단일 프로세스 사용 환경이므로 단계 간 분리된 트랜잭션이라도 race 위험이 거의 없다.
+    (TODO: 멀티 프로세스/병행 쓰기 환경 대비 시 단일 트랜잭션으로 묶어야 함.)
+
+    Args:
+        document_id: 수정할 문서 PK.
+        edited_text: 새 본문 (빈 문자열도 허용 — 의도적 비우기).
+        user_id: 소유권 검증용 사용자 식별자.
+        created_by: 버전 이력에 기록할 수정자 식별자.
+
+    Returns:
+        명세 응답 필드 dict:
+            - document_text_id: document_texts 행의 PK
+            - version_id: document_versions 행의 PK
+            - version_no: 새로 부여된 버전 번호
+            - updated_at: 갱신 시각 (ISO-8601 UTC)
+
+    Raises:
+        DocumentNotFoundError: 문서가 없거나, 소유권 불일치, 또는 soft-delete 상태.
+    """
+    from app.repositories import document_repository  # 지연 import (순환 방지)
+
+    # ---- 1) 문서 존재/소유권 검증 ----
+    if not document_repository.document_exists_for_user(
+        document_id=document_id, user_id=user_id
+    ):
+        raise DocumentNotFoundError(
+            f"문서 #{document_id} 를 찾을 수 없습니다."
+        )
+
+    # ---- 2) 새 version_no 계산 ----
+    next_version_no = (
+        document_repository.get_max_version_no(document_id=document_id) + 1
+    )
+
+    # ---- 공통 시각 ----
+    # 모든 쓰기에 같은 시각을 사용하면 후속 디버깅이 쉽다 (한 번에 묶인 작업임이 자명).
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # ---- 3) document_texts UPSERT ----
+    existing_text_id = document_repository.find_document_text_id(
+        document_id=document_id
+    )
+    if existing_text_id is None:
+        # 텍스트 행이 아직 없으면 새로 INSERT.
+        document_text_id = document_repository.insert_document_text(
+            document_id=document_id,
+            extracted_text=edited_text,
+            text_version=next_version_no,
+            updated_at=now_iso,
+        )
+    else:
+        # 이미 있으면 UPDATE 만 수행하고 동일 PK 를 그대로 응답에 사용.
+        document_repository.update_document_text(
+            text_id=existing_text_id,
+            extracted_text=edited_text,
+            text_version=next_version_no,
+            updated_at=now_iso,
+        )
+        document_text_id = existing_text_id
+
+    # ---- 4) 버전 이력 추가 ----
+    version_id = document_repository.insert_document_version(
+        document_id=document_id,
+        version_no=next_version_no,
+        text_snapshot=edited_text,
+        created_by=created_by,
+        created_at=now_iso,
+    )
+
+    # ---- 5) documents.updated_at 갱신 ----
+    document_repository.update_document_updated_at(
+        document_id=document_id, updated_at=now_iso
+    )
+
+    # ---- 6) 응답 데이터 구성 ----
+    return {
+        "document_text_id": document_text_id,
+        "version_id": version_id,
+        "version_no": next_version_no,
+        "updated_at": now_iso,
     }
