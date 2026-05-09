@@ -86,12 +86,24 @@ class FileTooLargeError(ValueError):
 # ---------------------------------------------------------------------------
 def _init_db() -> None:
     """
-    `documents` 테이블이 없으면 생성한다.
+    프로젝트에서 사용하는 모든 테이블이 없으면 생성하고, 기존 테이블에는 누락된 컬럼을 보강한다.
 
-    모듈이 처음 import 될 때 한 번 호출되어, 첫 요청 이전에 스키마를 보장한다.
-    `IF NOT EXISTS` 덕분에 여러 번 호출되어도 안전하다.
+    동작 흐름:
+        1. `documents` 테이블을 신규 풀스키마로 생성 (이미 있으면 NO-OP).
+        2. 이미 존재하는 `documents` 의 컬럼 목록을 조회해, 누락된 컬럼만 ALTER 로 추가.
+           (구버전 DB 와 호환성 유지를 위한 idempotent 마이그레이션)
+        3. `document_texts` 테이블을 신규 생성 (없을 때만).
+
+    SQLite 의 ALTER TABLE ADD COLUMN 은 NOT NULL 컬럼일 경우 DEFAULT 가 필수다.
+    따라서 NOT NULL 로 추가하는 컬럼(source_type, parse_status)에는 DEFAULT 값을 명시한다.
+    그 외(title, folder_id, updated_at, deleted_at)는 nullable 이라 DEFAULT 없이도 안전하다.
+
+    이 함수는 모듈 import 시점에 1회 호출되며, 여러 번 호출되어도 부작용이 없도록 설계되었다.
     """
     with sqlite3.connect(DB_PATH) as conn:
+        # ---- 1) documents 풀스키마 (신규 환경용) ----
+        # 이미 테이블이 있으면 IF NOT EXISTS 가 NO-OP 이므로,
+        # 구버전 스키마는 아래 ALTER 단계에서 보강된다.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS documents (
@@ -103,10 +115,64 @@ def _init_db() -> None:
                 file_extension TEXT NOT NULL,
                 file_size INTEGER NOT NULL,
                 content_type TEXT,
-                created_at TEXT NOT NULL
+                title TEXT,
+                source_type TEXT NOT NULL DEFAULT 'upload',
+                parse_status TEXT NOT NULL DEFAULT 'pending',
+                folder_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                deleted_at TEXT
             )
             """
         )
+
+        # ---- 2) 구버전 documents 에 컬럼 보강 ----
+        # PRAGMA table_info 로 현재 컬럼 목록을 가져와 누락된 항목만 추가한다.
+        existing_columns = {
+            row[1]  # PRAGMA table_info 결과의 두 번째 필드가 컬럼 이름
+            for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+        }
+        column_specs = (
+            ("title", "TEXT"),
+            ("source_type", "TEXT NOT NULL DEFAULT 'upload'"),
+            ("parse_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("folder_id", "INTEGER"),
+            ("updated_at", "TEXT"),
+            ("deleted_at", "TEXT"),
+        )
+        for column_name, column_definition in column_specs:
+            if column_name not in existing_columns:
+                # f-string 사용은 컬럼 이름/정의가 모두 코드 내부 상수라 SQL 인젝션 위험 없음.
+                conn.execute(
+                    f"ALTER TABLE documents ADD COLUMN {column_name} {column_definition}"
+                )
+
+        # ---- 3) document_texts 신규 테이블 ----
+        # OCR/AI 처리 결과를 분리해서 저장하는 테이블.
+        # documents 와 1:N 관계 (text_version 으로 버전 관리)
+        # FOREIGN KEY 는 SQLite 기본 enforcement 가 OFF 이지만 향후 활성화 대비 명시.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_texts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                extracted_text TEXT,
+                cleaned_text TEXT,
+                summary TEXT,
+                keywords TEXT,
+                text_version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT,
+                FOREIGN KEY (document_id) REFERENCES documents(id)
+            )
+            """
+        )
+
+        # `document_id` 로 자주 조회될 가능성이 높으므로 인덱스 생성.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_document_texts_document_id "
+            "ON document_texts(document_id)"
+        )
+
         conn.commit()
 
 
@@ -235,4 +301,92 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
         "file_size": file_size,
         "content_type": file.content_type,
         "created_at": created_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 조회 관련 도메인 예외
+# ---------------------------------------------------------------------------
+class DocumentNotFoundError(LookupError):
+    """요청한 문서가 존재하지 않거나 다른 사용자의 것이거나 soft-delete 된 경우 발생."""
+
+
+# ---------------------------------------------------------------------------
+# 조회 서비스 함수
+# ---------------------------------------------------------------------------
+# 라우터는 아래 함수를 호출하고, 함수는 다시 repository 계층(`document_repository`) 을 호출한다.
+# DB 쿼리 자체는 본 모듈이 아닌 repository 에서만 수행된다 (아키텍처 규칙).
+# 본 함수들은 DB 결과(raw row dict)를 명세서가 요구하는 응답 필드로 매핑·정제한다.
+#
+# TODO(repository import): 순환 import 방지를 위해 함수 내부에서 지연 import 한다.
+# 모듈 최상단에서 import 하면 repository 가 service 의 다른 심볼을 참조할 때 충돌 가능.
+
+
+def list_documents(user_id: int) -> list[dict]:
+    """
+    특정 사용자의 활성(soft-delete 되지 않은) 문서 목록을 명세 응답 필드로 정제하여 반환한다.
+
+    Args:
+        user_id: 데모 사용자 식별자.
+
+    Returns:
+        명세서가 요구하는 필드로만 구성된 dict 들의 리스트.
+        필드: id, title, source_type, file_type, parse_status, created_at, updated_at
+    """
+    from app.repositories import document_repository  # 지연 import
+
+    rows = document_repository.list_active_documents_by_user(user_id=user_id)
+    # DB 컬럼명(`file_extension`)을 응답 필드명(`file_type`)으로 매핑한다.
+    # 응답 스펙은 추후 file_type 의 의미가 확장될 수 있으나(MIME 등),
+    # 현재 단계에선 확장자 문자열을 그대로 노출.
+    return [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "source_type": row["source_type"],
+            "file_type": row["file_extension"],
+            "parse_status": row["parse_status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_document(document_id: int, user_id: int) -> dict:
+    """
+    단일 문서를 조회하여, document_texts 의 extracted_text 와 함께 반환한다.
+
+    Args:
+        document_id: 조회 대상 문서의 PK.
+        user_id: 데모 사용자 식별자 (소유권 검증용).
+
+    Returns:
+        명세 응답 필드 + extracted_text(없으면 None) 가 포함된 dict.
+
+    Raises:
+        DocumentNotFoundError: 해당 id 의 문서가 없거나, 다른 사용자의 것이거나, soft-delete 된 경우.
+    """
+    from app.repositories import document_repository  # 지연 import
+
+    row = document_repository.get_document_with_latest_text(
+        document_id=document_id, user_id=user_id
+    )
+    if row is None:
+        raise DocumentNotFoundError(
+            f"문서 #{document_id} 를 찾을 수 없습니다."
+        )
+
+    # repository 가 documents + document_texts 조인 결과를 평탄화한 dict 를 돌려주므로,
+    # 여기서는 응답 스키마에 맞게 필요한 필드만 골라낸다.
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "source_type": row["source_type"],
+        "file_type": row["file_extension"],
+        "parse_status": row["parse_status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        # document_texts 가 없으면 None 으로 통일 (명세 요구사항).
+        "extracted_text": row.get("extracted_text"),
     }

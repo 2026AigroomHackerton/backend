@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from app.services import document_service
 from app.services.document_service import (
+    DocumentNotFoundError,
     EmptyFileError,
     FileTooLargeError,
     UnsupportedFileTypeError,
@@ -52,12 +53,13 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 # FastAPI 의 기본 HTTPException 은 본문을 `{"detail": "..."}` 으로 자동 직렬화한다.
 # 그러나 명세서는 모든 응답이 `{"success": bool, "data": ...}` 구조여야 한다고 정한다.
 # 따라서 라우터 내부에서 직접 JSONResponse 를 반환하여 포맷을 강제한다.
-def _success_response(data: dict, status_code: int = status.HTTP_200_OK) -> JSONResponse:
+def _success_response(data, status_code: int = status.HTTP_200_OK) -> JSONResponse:
     """
     성공 응답 빌더.
 
     Args:
-        data: 응답 본문 `data` 필드에 들어갈 값(여기서는 문서 메타데이터 dict).
+        data: 응답 본문 `data` 필드에 들어갈 값. dict 또는 list 등 JSON 직렬화 가능 타입.
+            (목록 조회는 list, 단일 조회/생성은 dict 가 들어온다.)
         status_code: HTTP 상태 코드. 기본 200, 리소스 생성 시 201 등으로 호출자가 지정.
 
     Returns:
@@ -167,3 +169,74 @@ async def upload_document(
     # ---- 성공 응답 ----
     # 새 리소스 생성이므로 201 Created.
     return _success_response(document, status_code=status.HTTP_201_CREATED)
+
+
+# ---------------------------------------------------------------------------
+# 엔드포인트: 문서 목록 조회
+# ---------------------------------------------------------------------------
+@router.get("")
+async def list_documents() -> JSONResponse:
+    """
+    데모 사용자(`user_id=1`)의 활성 문서 목록을 반환한다.
+
+    "활성" = soft-delete 되지 않은 (deleted_at IS NULL) 문서.
+
+    응답 data 는 각 문서별 dict 들의 리스트이며, 각 dict 는 다음 필드를 포함한다.
+        id, title, source_type, file_type, parse_status, created_at, updated_at
+
+    Returns:
+        성공 시 200 + {"success": true, "data": [...]}
+        예기치 못한 오류 시 500 + 명세 형식 에러
+    """
+    try:
+        documents = document_service.list_documents(user_id=DEMO_USER_ID)
+    except Exception as exc:  # noqa: BLE001
+        # 운영에서는 여기서 로깅. MVP 라 메시지만 회피적으로 노출.
+        return _error_response(
+            message=f"문서 목록 조회 중 오류가 발생했습니다: {exc}",
+            code="INTERNAL_SERVER_ERROR",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return _success_response(documents, status_code=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# 엔드포인트: 단일 문서 조회
+# ---------------------------------------------------------------------------
+@router.get("/{document_id}")
+async def get_document(document_id: int) -> JSONResponse:
+    """
+    데모 사용자의 단일 문서를 조회한다.
+
+    document_texts 에 해당 문서의 텍스트가 있으면 extracted_text 를 함께 반환하고,
+    없으면 null 로 채워 명세를 만족시킨다.
+
+    Args:
+        document_id: 경로 파라미터. FastAPI 가 int 로 자동 캐스팅하며 실패 시 422 가 뜨지만,
+            현재 라우터에서 422 를 명세 형식으로 변환하는 로직은 없다.
+            (TODO: main.py 에 RequestValidationError exception_handler 등록 필요)
+
+    Returns:
+        - 200 + {"success": true, "data": {...}}: 정상
+        - 404 + {"success": false, "data": {"code":"DOCUMENT_NOT_FOUND", ...}}: 미존재/소유권 불일치/삭제됨
+        - 500 + 명세 형식 에러: 예기치 못한 오류
+    """
+    try:
+        document = document_service.get_document(
+            document_id=document_id, user_id=DEMO_USER_ID
+        )
+    except DocumentNotFoundError as exc:
+        return _error_response(
+            message=str(exc),
+            code="DOCUMENT_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"문서 조회 중 오류가 발생했습니다: {exc}",
+            code="INTERNAL_SERVER_ERROR",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return _success_response(document, status_code=status.HTTP_200_OK)
