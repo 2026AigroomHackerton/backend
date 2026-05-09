@@ -222,25 +222,45 @@ class StorageService:
         if db is not None:
             try:
                 # SQLAlchemy text() 로 raw SQL 실행.
-                # ORM 클래스를 선언하지 않는 이유: documents/document_texts 모델은
-                # "절대 수정 금지" 영역이라 본 파일에서 모델 클래스를 만들 수 없다.
-                # 대신 명세에 정해진 컬럼명을 그대로 SQL 에 박아 사용한다.
+                # ORM 모델 대신 raw SQL 을 쓰는 이유: 본 서비스는 BE2 영역이고
+                # documents 모델 정의는 BE1/통합 단계에서 관리하므로 결합을 낮춘다.
                 from sqlalchemy import text as _sql_text  # type: ignore
+                import uuid as _uuid  # stored_filename 충돌 회피용
 
-                # ISO8601 문자열로 시간 일관성 유지 (명세 그대로).
+                # ISO8601 문자열로 시간 일관성 유지.
                 now_iso = datetime.utcnow().isoformat()
 
                 # ----- documents INSERT -----------------------------------------
-                # RETURNING 은 SQLite 3.35+ 에서 지원. 하위 호환을 위해 lastrowid 사용.
+                # documents 테이블의 NOT NULL 컬럼:
+                #   user_id, original_filename, stored_filename, file_path,
+                #   file_extension, file_size, created_at, source_type, parse_status
+                # mock 임포트는 실제 파일이 없으므로 더미 메타데이터를 채운다.
+                # stored_filename 은 UNIQUE 제약이라 uuid 단편으로 충돌 회피.
+                stored = f"mock_{_uuid.uuid4().hex[:12]}.txt"
+                file_size_bytes = len(text.encode("utf-8"))
+
                 doc_result = db.execute(
                     _sql_text(
-                        "INSERT INTO documents "
-                        "(title, source_type, file_type, parse_status, "
-                        " owner_type, owner_id, created_at) "
-                        "VALUES (:title, 'mock', 'txt', 'done', "
-                        "        'user', 1, :created_at)"
+                        "INSERT INTO documents ("
+                        " user_id, original_filename, stored_filename, file_path,"
+                        " file_extension, file_size, content_type,"
+                        " title, source_type, file_type, parse_status,"
+                        " owner_type, owner_id, created_at"
+                        ") VALUES ("
+                        " 1, :original_filename, :stored_filename, :file_path,"
+                        " '.txt', :file_size, 'text/plain',"
+                        " :title, 'mock', 'txt', 'done',"
+                        " 'user', 1, :created_at"
+                        ")"
                     ),
-                    {"title": title, "created_at": now_iso},
+                    {
+                        "original_filename": f"sample_{document_type}.txt",
+                        "stored_filename": stored,
+                        "file_path": f"mock://samples/{stored}",
+                        "file_size": file_size_bytes,
+                        "title": title,
+                        "created_at": now_iso,
+                    },
                 )
                 # SQLAlchemy 의 CursorResult 는 lastrowid 속성을 제공.
                 imported_document_id = doc_result.lastrowid
