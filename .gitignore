@@ -19,6 +19,8 @@ uploads/*
 !uploads/.gitkeep
 data/*
 !data/.gitkeep
+generated_hwpx/
+shared_exports/
 *.db
 *.sqlite3
 

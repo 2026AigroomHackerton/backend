@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # 비즈니스 로직 클래스.
-from app.services.storage_service import StorageService
+from app.services.storage_service import ExternalImportError, StorageService
 
 
 # -----------------------------------------------------------------------------
@@ -81,6 +81,15 @@ storage_service = StorageService()
 # -----------------------------------------------------------------------------
 # 요청 스키마 — POST /api/connectors/mock-import
 # -----------------------------------------------------------------------------
+class ExternalImportRequest(BaseModel):
+    """Request body for external storage import.
+
+    If external_id is omitted, GOOGLE_DRIVE_FILE_ID / NOTION_PAGE_ID from .env is used.
+    """
+
+    external_id: str | None = Field(None, description="provider document id")
+
+
 class MockImportRequest(BaseModel):
     """mock-import 의 request body 스키마.
 
@@ -235,39 +244,47 @@ async def mock_import(
 # OAuth 인증 흐름 미구현. 명세상 HTTP 501 + 안내 메시지.
 @router.post(
     "/api/connectors/google-drive/import",
-    summary="Google Drive 임포트 (준비 중)",
-    description="OAuth 인증 구현 후 활성화 예정입니다. 현재 501 반환.",
+    status_code=status.HTTP_200_OK,
+    summary="Import Google Drive document",
+    description="Import a Drive document with GOOGLE_DRIVE_ACCESS_TOKEN and save it as HWPX.",
 )
-def google_drive_import_stub() -> JSONResponse:
-    """Google Drive 임포트 stub (HTTP 501).
-
-    실제 구현 시:
-      1) OAuth 인증 콜백으로 access_token 확보.
-      2) Drive API 로 file 메타/본문 다운로드.
-      3) documents/document_texts INSERT 후 imported_document_id 반환.
-    """
-    return _not_implemented(
-        "Google Drive 연동은 준비 중입니다. OAuth 인증 구현 후 활성화됩니다."
-    )
+async def google_drive_import(
+    payload: ExternalImportRequest | None = None,
+    db: Any = Depends(get_db),
+) -> Any:
+    """Import a Google Drive file into documents/document_texts."""
+    try:
+        result = await storage_service.import_external_document(
+            provider="google_drive",
+            db=db,
+            external_id=payload.external_id if payload else None,
+        )
+    except ExternalImportError as exc:
+        return _bad_request(message=str(exc), error=exc.code)
+    return _ok(result, message="Google Drive document imported.")
 
 
 # =============================================================================
-# ⑤ POST /api/connectors/notion/import — stub
+# ? POST /api/connectors/notion/import
 # =============================================================================
-# Integration Token 미설정. 명세상 HTTP 501 + 안내 메시지.
+# Notion integration token based import.
 @router.post(
     "/api/connectors/notion/import",
-    summary="Notion 임포트 (준비 중)",
-    description="Integration Token 설정 후 활성화 예정입니다. 현재 501 반환.",
+    status_code=status.HTTP_200_OK,
+    summary="Import Notion page",
+    description="Import a Notion page with NOTION_API_TOKEN and save it as HWPX.",
 )
-def notion_import_stub() -> JSONResponse:
-    """Notion 임포트 stub (HTTP 501).
-
-    실제 구현 시:
-      1) NOTION_API_TOKEN 으로 Notion API 호출.
-      2) 페이지/블록 텍스트 추출.
-      3) documents/document_texts INSERT 후 imported_document_id 반환.
-    """
-    return _not_implemented(
-        "Notion 연동은 준비 중입니다. Integration Token 설정 후 활성화됩니다."
-    )
+async def notion_import(
+    payload: ExternalImportRequest | None = None,
+    db: Any = Depends(get_db),
+) -> Any:
+    """Import a Notion page into documents/document_texts."""
+    try:
+        result = await storage_service.import_external_document(
+            provider="notion",
+            db=db,
+            external_id=payload.external_id if payload else None,
+        )
+    except ExternalImportError as exc:
+        return _bad_request(message=str(exc), error=exc.code)
+    return _ok(result, message="Notion page imported.")

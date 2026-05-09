@@ -66,6 +66,7 @@ class CommandEditRequest(BaseModel):
 
     # ...(Ellipsis)는 "필수 필드"를 의미. 빠지면 422로 거절된다.
     document_id: str = Field(..., description="대상 문서 ID")
+    document_text: str | None = Field(default=None, description="?? ????? ??? ?? ??")
     command_text: str = Field(..., description="음성/텍스트로 입력된 사용자 명령")
     scope: str = Field(..., description="수정 범위 (예: section, paragraph, document)")
 
@@ -125,6 +126,7 @@ def command_edit(
         command_text=req.command_text,
         scope=req.scope,
         db=db,
+        document_text=req.document_text,
     )
 
     # 서비스가 돌려준 dict를 공통 응답 포맷으로 래핑하여 반환.

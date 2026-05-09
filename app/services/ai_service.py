@@ -45,6 +45,7 @@ def generate_mock_edit_plan(
     document_id: str,
     command_text: str,
     scope: str,
+    document_text: str | None = None,
 ) -> dict[str, Any]:
     """음성/텍스트 명령을 받아 EditOperation 형식의 가짜 수정 계획을 반환한다.
 
@@ -76,6 +77,32 @@ def generate_mock_edit_plan(
     """
     # 명세서 예시 그대로의 EditOperation 페이로드.
     # 키 이름/순서는 프런트엔드와 합의된 스키마를 따른다.
+    if document_text and document_text.strip():
+        base_text = document_text.strip()
+        rewritten_text = f"{base_text}\n\n[AI ?? ?? ??]\n{command_text.strip()}"
+        return {
+            "summary": "?? ?? ??? ???? ?? ??? ??????.",
+            "edit_operations": [
+                {
+                    "operation_id": "op_001",
+                    "type": "rewrite_document",
+                    "target": "document",
+                    "before_text": base_text,
+                    "after_text": rewritten_text,
+                    "reason": "OpenAI ??? ??? ??? ???? ??? ??? ?? ??? ???? ?????.",
+                    "requires_user_confirm": True,
+                    "confidence": 0.6,
+                }
+            ],
+            "preview_text": rewritten_text,
+            "_echo": {
+                "document_id": document_id,
+                "command_text": command_text,
+                "scope": scope,
+                "_source": "mock_with_document_text",
+            },
+        }
+
     return {
         # summary: 사용자에게 "AI가 이렇게 이해했다"를 한 줄로 보여주는 요약문.
         "summary": "체육 활동 안내문을 환경정화 활동 안내문으로 변경",
@@ -294,6 +321,7 @@ def generate_edit_plan(
     command_text: str,
     scope: str,
     db: Any = None,
+    document_text: str | None = None,
 ) -> dict[str, Any]:
     """공개 진입점: 실제 LLM 호출(가능하면) 또는 mock 응답을 반환.
 
@@ -311,11 +339,11 @@ def generate_edit_plan(
         db: SQLAlchemy Session 또는 None. 라우터에서 Depends(get_db) 로 주입.
     """
     # 본문 조회 — db 가 None 이면 None 반환되어 prompt 에서 생략됨.
-    document_text = _fetch_document_text(db, document_id)
+    resolved_document_text = document_text or _fetch_document_text(db, document_id)
 
     # 키가 없으면 굳이 try 안 들어가고 바로 mock.
     if get_client() is None:
-        return generate_mock_edit_plan(document_id, command_text, scope)
+        return generate_mock_edit_plan(document_id, command_text, scope, resolved_document_text)
 
     # 키가 있으면 실제 호출 시도. 실패 시 mock 폴백.
     try:
@@ -323,8 +351,8 @@ def generate_edit_plan(
             document_id=document_id,
             command_text=command_text,
             scope=scope,
-            document_text=document_text,
+            document_text=resolved_document_text,
         )
     except Exception as exc:  # noqa: BLE001 — 외부 호출은 모두 폴백 대상
         logger.warning("OpenAI 호출 실패 → mock 폴백: %s", exc)
-        return generate_mock_edit_plan(document_id, command_text, scope)
+        return generate_mock_edit_plan(document_id, command_text, scope, resolved_document_text)

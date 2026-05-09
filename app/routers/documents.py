@@ -1,29 +1,34 @@
-"""
-문서 관련 API 라우터.
+﻿"""
+臾몄꽌 愿??API ?쇱슦??
 
-이 모듈은 클라이언트(모바일 앱) 가 호출하는 HTTP 엔드포인트의 진입점이다.
-실제 비즈니스 로직(파일 저장·DB 기록 등)은 `app.services.document_service` 에 위임하고,
-본 모듈은 다음 책임만 진다.
-    - URL 경로 및 HTTP 메서드 정의
-    - 요청 파라미터(파일 등) 수신
-    - 서비스 호출 결과를 공통 응답 포맷으로 감싸 반환
-    - 도메인 예외를 적절한 HTTP 상태 코드로 변환
+??紐⑤뱢? ?대씪?댁뼵??紐⑤컮???? 媛 ?몄텧?섎뒗 HTTP ?붾뱶?ъ씤?몄쓽 吏꾩엯?먯씠??
+?ㅼ젣 鍮꾩쫰?덉뒪 濡쒖쭅(?뚯씪 ??Β텱B 湲곕줉 ??? `app.services.document_service` ???꾩엫?섍퀬,
+蹂?紐⑤뱢? ?ㅼ쓬 梨낆엫留?吏꾨떎.
+    - URL 寃쎈줈 諛?HTTP 硫붿꽌???뺤쓽
+    - ?붿껌 ?뚮씪誘명꽣(?뚯씪 ?? ?섏떊
+    - ?쒕퉬???몄텧 寃곌낵瑜?怨듯넻 ?묐떟 ?щ㎎?쇰줈 媛먯떥 諛섑솚
+    - ?꾨찓???덉쇅瑜??곸젅??HTTP ?곹깭 肄붾뱶濡?蹂??
 
-API 공통 규칙(명세서 기준):
-    - 모든 경로는 `/api` 접두사 사용 → 본 라우터는 `/api/documents` 까지 prefix 부여
-    - 응답 본문은 항상 `{"success": true/false, "data": ...}` 구조
-        - 성공 시 data: 도메인 결과 (예: 문서 메타데이터 dict)
-        - 실패 시 data: {"code": "<에러 코드>", "message": "<사람이 읽는 메시지>"}
-    - 인증은 해커톤 MVP 단계에서 생략, `user_id=1` 데모 사용자 고정
+API 怨듯넻 洹쒖튃(紐낆꽭??湲곗?):
+    - 紐⑤뱺 寃쎈줈??`/api` ?묐몢???ъ슜 ??蹂??쇱슦?곕뒗 `/api/documents` 源뚯? prefix 遺??
+    - ?묐떟 蹂몃Ц? ??긽 `{"success": true/false, "data": ...}` 援ъ“
+        - ?깃났 ??data: ?꾨찓??寃곌낵 (?? 臾몄꽌 硫뷀??곗씠??dict)
+        - ?ㅽ뙣 ??data: {"code": "<?먮윭 肄붾뱶>", "message": "<?щ엺???쎈뒗 硫붿떆吏>"}
+    - ?몄쬆? ?댁빱??MVP ?④퀎?먯꽌 ?앸왂, `user_id=1` ?곕え ?ъ슜??怨좎젙
 """
 
 from __future__ import annotations
 
+import uuid
+
+from pathlib import Path
 from fastapi import APIRouter, File, Form, Query, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.services import document_service
+from app.services import openai_document_service
+from app.services.hwpx_template_service import HwpxTemplateError, create_generated_hwpx
 from app.services.document_service import (
     DocumentNotFoundError,
     EmptyFileError,
@@ -32,38 +37,38 @@ from app.services.document_service import (
 )
 
 # ---------------------------------------------------------------------------
-# 데모 사용자 ID
+# ?곕え ?ъ슜??ID
 # ---------------------------------------------------------------------------
-# 인증/세션을 도입하기 전 임시로 사용하는 고정 사용자 식별자.
-# 실서비스 전환 시 토큰 디코딩 후 주입되는 값으로 교체될 예정.
+# ?몄쬆/?몄뀡???꾩엯?섍린 ???꾩떆濡??ъ슜?섎뒗 怨좎젙 ?ъ슜???앸퀎??
+# ?ㅼ꽌鍮꾩뒪 ?꾪솚 ???좏겙 ?붿퐫????二쇱엯?섎뒗 媛믪쑝濡?援먯껜???덉젙.
 DEMO_USER_ID = 1
 
 # ---------------------------------------------------------------------------
-# 라우터 정의
+# ?쇱슦???뺤쓽
 # ---------------------------------------------------------------------------
 # prefix:
-#     "/api/documents" — 명세서의 `/api` 공통 접두사 + 문서 도메인 경로
+#     "/api/documents" ??紐낆꽭?쒖쓽 `/api` 怨듯넻 ?묐몢??+ 臾몄꽌 ?꾨찓??寃쎈줈
 # tags:
-#     ["documents"] — Swagger UI 에서 동일 그룹으로 묶이도록 표기
+#     ["documents"] ??Swagger UI ?먯꽌 ?숈씪 洹몃９?쇰줈 臾띠씠?꾨줉 ?쒓린
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 
 # ---------------------------------------------------------------------------
-# 응답 빌더 (공통 포맷 보장)
+# ?묐떟 鍮뚮뜑 (怨듯넻 ?щ㎎ 蹂댁옣)
 # ---------------------------------------------------------------------------
-# FastAPI 의 기본 HTTPException 은 본문을 `{"detail": "..."}` 으로 자동 직렬화한다.
-# 그러나 명세서는 모든 응답이 `{"success": bool, "data": ...}` 구조여야 한다고 정한다.
-# 따라서 라우터 내부에서 직접 JSONResponse 를 반환하여 포맷을 강제한다.
+# FastAPI ??湲곕낯 HTTPException ? 蹂몃Ц??`{"detail": "..."}` ?쇰줈 ?먮룞 吏곷젹?뷀븳??
+# 洹몃윭??紐낆꽭?쒕뒗 紐⑤뱺 ?묐떟??`{"success": bool, "data": ...}` 援ъ“?ъ빞 ?쒕떎怨??뺥븳??
+# ?곕씪???쇱슦???대??먯꽌 吏곸젒 JSONResponse 瑜?諛섑솚?섏뿬 ?щ㎎??媛뺤젣?쒕떎.
 def _success_response(data, status_code: int = status.HTTP_200_OK) -> JSONResponse:
     """
-    성공 응답 빌더 — 통합 공통 envelope 4-key.
+    ?깃났 ?묐떟 鍮뚮뜑 ???듯빀 怨듯넻 envelope 4-key.
 
-    공통 응답 스펙:
+    怨듯넻 ?묐떟 ?ㅽ럺:
         {"success": bool, "data": dict|null, "message": str, "error": str|null}
 
     Args:
-        data: 응답 본문 `data` 필드에 들어갈 값. dict / list / None 모두 허용.
-        status_code: HTTP 상태 코드. 기본 200, 리소스 생성 시 201 등.
+        data: ?묐떟 蹂몃Ц `data` ?꾨뱶???ㅼ뼱媛?媛? dict / list / None 紐⑤몢 ?덉슜.
+        status_code: HTTP ?곹깭 肄붾뱶. 湲곕낯 200, 由ъ냼???앹꽦 ??201 ??
     """
     return JSONResponse(
         status_code=status_code,
@@ -78,15 +83,15 @@ def _success_response(data, status_code: int = status.HTTP_200_OK) -> JSONRespon
 
 def _error_response(message: str, code: str, status_code: int) -> JSONResponse:
     """
-    에러 응답 빌더 — 통합 공통 envelope 4-key.
+    ?먮윭 ?묐떟 鍮뚮뜑 ???듯빀 怨듯넻 envelope 4-key.
 
-    이전 형식(`data` 안에 code/message 패킹) 에서 통합 envelope 으로 이전:
-        {"success": False, "data": null, "message": <설명>, "error": <CODE>}
+    ?댁쟾 ?뺤떇(`data` ?덉뿉 code/message ?⑦궧) ?먯꽌 ?듯빀 envelope ?쇰줈 ?댁쟾:
+        {"success": False, "data": null, "message": <?ㅻ챸>, "error": <CODE>}
 
     Args:
-        message: 사용자/개발자에게 보일 한국어 메시지.
-        code: 클라이언트 분기용 영문 에러 코드 (예: "UNSUPPORTED_FILE_TYPE").
-        status_code: HTTP 상태 코드 (400, 413 등).
+        message: ?ъ슜??媛쒕컻?먯뿉寃?蹂댁씪 ?쒓뎅??硫붿떆吏.
+        code: ?대씪?댁뼵??遺꾧린???곷Ц ?먮윭 肄붾뱶 (?? "UNSUPPORTED_FILE_TYPE").
+        status_code: HTTP ?곹깭 肄붾뱶 (400, 413 ??.
     """
     return JSONResponse(
         status_code=status_code,
@@ -100,41 +105,89 @@ def _error_response(message: str, code: str, status_code: int) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# 엔드포인트: 문서 업로드
+# ?붾뱶?ъ씤?? 臾몄꽌 ?낅줈??
 # ---------------------------------------------------------------------------
-@router.post("/upload")
-async def upload_document(
-    file: UploadFile | None = File(default=None),
-    # 명세 [BE1 - Documents API] 의 추가 multipart 필드.
-    # 누락 가능(optional) 이라 기본값을 None / 'upload' 로 둔다.
-    title: str | None = Form(default=None, description="사용자 지정 문서 제목"),
-    source_type: str = Form(default="upload", description="출처 유형 (upload/mock/...)"),
-    folder_id: int | None = Form(default=None, description="속할 폴더 ID"),
-    category: str | None = Form(default=None, description="(예약) 카테고리"),
-) -> JSONResponse:
+
+@router.post("/image-to-hwpx")
+async def image_to_hwpx(file: UploadFile | None = File(default=None)):
+    """Create a valid HWPX file from an uploaded image.
+
+    Flow:
+    image -> OpenAI Vision JSON(title/body) -> blank_template.hwpx ->
+    Contents/section0.xml placeholder replacement -> validate -> FileResponse.
     """
-    문서 업로드 엔드포인트.
-
-    명세 multipart 필드: file(필수), title?, source_type?, folder_id?, category?
-    `category` 는 현재 documents 테이블에 컬럼이 없어 본 PR 에서는 받기만 하고 무시한다.
-        TODO: documents 테이블에 category 컬럼 추가 후 service 에 전달.
-
-    응답: 통합 envelope 4-key (success, data, message, error).
-        성공 시 data: 생성된 문서 메타데이터 dict.
-        실패 시 data=null, error=<CODE>, message=<설명>.
-    """
-
-    # ---- 파일 누락 방어 ----
-    # FastAPI 가 자동 422 검증 응답을 띄우면 명세 형식이 깨지므로
-    # `default=None` 으로 받아 직접 명세 형식으로 변환한다.
     if file is None:
         return _error_response(
-            message="파일이 첨부되지 않았습니다. multipart/form-data 의 'file' 필드를 확인해 주세요.",
+            message="image file is required.",
             code="MISSING_FILE",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
-    # ---- 비즈니스 로직 위임 + 도메인 예외 변환 ----
+    try:
+        document = await openai_document_service.image_to_document_json(file)
+        stem_source = Path(file.filename or document["title"] or "captured_document").stem
+        output_path = create_generated_hwpx(
+            title=document["title"],
+            body=document["body"],
+            filename_stem=stem_source,
+        )
+        return FileResponse(
+            path=output_path,
+            filename=output_path.name,
+            media_type="application/haansofthwpx",
+            headers={"X-Document-Title": document["title"].encode("utf-8").hex()},
+        )
+    except openai_document_service.OpenAiDocumentError as exc:
+        return _error_response(
+            message=str(exc),
+            code="OPENAI_DOCUMENT_FAILED",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+    except HwpxTemplateError as exc:
+        return _error_response(
+            message=str(exc),
+            code="HWPX_TEMPLATE_INVALID",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"failed to create HWPX from image: {exc}",
+            code="IMAGE_TO_HWPX_FAILED",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+@router.post("/upload")
+async def upload_document(
+    file: UploadFile | None = File(default=None),
+    # 紐낆꽭 [BE1 - Documents API] ??異붽? multipart ?꾨뱶.
+    # ?꾨씫 媛??optional) ?대씪 湲곕낯媛믪쓣 None / 'upload' 濡??붾떎.
+    title: str | None = Form(default=None, description="?ъ슜??吏??臾몄꽌 ?쒕ぉ"),
+    source_type: str = Form(default="upload", description="異쒖쿂 ?좏삎 (upload/mock/...)"),
+    folder_id: int | None = Form(default=None, description="?랁븷 ?대뜑 ID"),
+    category: str | None = Form(default=None, description="(?덉빟) 移댄뀒怨좊━"),
+) -> JSONResponse:
+    """
+    臾몄꽌 ?낅줈???붾뱶?ъ씤??
+
+    紐낆꽭 multipart ?꾨뱶: file(?꾩닔), title?, source_type?, folder_id?, category?
+    `category` ???꾩옱 documents ?뚯씠釉붿뿉 而щ읆???놁뼱 蹂?PR ?먯꽌??諛쏄린留??섍퀬 臾댁떆?쒕떎.
+        TODO: documents ?뚯씠釉붿뿉 category 而щ읆 異붽? ??service ???꾨떖.
+
+    ?묐떟: ?듯빀 envelope 4-key (success, data, message, error).
+        ?깃났 ??data: ?앹꽦??臾몄꽌 硫뷀??곗씠??dict.
+        ?ㅽ뙣 ??data=null, error=<CODE>, message=<?ㅻ챸>.
+    """
+
+    # ---- ?뚯씪 ?꾨씫 諛⑹뼱 ----
+    # FastAPI 媛 ?먮룞 422 寃利??묐떟???꾩슦硫?紐낆꽭 ?뺤떇??源⑥?誘濡?
+    # `default=None` ?쇰줈 諛쏆븘 吏곸젒 紐낆꽭 ?뺤떇?쇰줈 蹂?섑븳??
+    if file is None:
+        return _error_response(
+            message="?뚯씪??泥⑤??섏? ?딆븯?듬땲?? multipart/form-data ??'file' ?꾨뱶瑜??뺤씤??二쇱꽭??",
+            code="MISSING_FILE",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # ---- 鍮꾩쫰?덉뒪 濡쒖쭅 ?꾩엫 + ?꾨찓???덉쇅 蹂??----
     try:
         document = await document_service.upload_document(
             file=file,
@@ -145,60 +198,60 @@ async def upload_document(
             category=category,
         )
     except UnsupportedFileTypeError as exc:
-        # 클라이언트의 잘못된 입력 → 400 Bad Request
+        # ?대씪?댁뼵?몄쓽 ?섎せ???낅젰 ??400 Bad Request
         return _error_response(
             message=str(exc),
             code="UNSUPPORTED_FILE_TYPE",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     except EmptyFileError as exc:
-        # 빈 파일도 잘못된 입력으로 간주 → 400 Bad Request
+        # 鍮??뚯씪???섎せ???낅젰?쇰줈 媛꾩＜ ??400 Bad Request
         return _error_response(
             message=str(exc),
             code="EMPTY_FILE",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     except FileTooLargeError as exc:
-        # 크기 초과는 RFC 9110 의 의미상 413 Payload Too Large 가 적합.
+        # ?ш린 珥덇낵??RFC 9110 ???섎???413 Payload Too Large 媛 ?곹빀.
         return _error_response(
             message=str(exc),
             code="FILE_TOO_LARGE",
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
         )
     except Exception as exc:  # noqa: BLE001
-        # 예기치 못한 서버 오류도 명세 형식으로 응답해야 하므로 광범위 catch.
-        # 운영 환경에서는 여기서 로깅/모니터링 도구 연동 필요.
+        # ?덇린移?紐삵븳 ?쒕쾭 ?ㅻ쪟??紐낆꽭 ?뺤떇?쇰줈 ?묐떟?댁빞 ?섎?濡?愿묐쾾??catch.
+        # ?댁쁺 ?섍꼍?먯꽌???ш린??濡쒓퉭/紐⑤땲?곕쭅 ?꾧뎄 ?곕룞 ?꾩슂.
         return _error_response(
-            message=f"서버 내부 오류가 발생했습니다: {exc}",
+            message=f"?쒕쾭 ?대? ?ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {exc}",
             code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    # ---- 성공 응답 ----
-    # 새 리소스 생성이므로 201 Created.
+    # ---- ?깃났 ?묐떟 ----
+    # ??由ъ냼???앹꽦?대?濡?201 Created.
     return _success_response(document, status_code=status.HTTP_201_CREATED)
 
 
 # ---------------------------------------------------------------------------
-# 엔드포인트: 문서 목록 조회
+# ?붾뱶?ъ씤?? 臾몄꽌 紐⑸줉 議고쉶
 # ---------------------------------------------------------------------------
 @router.get("")
 async def list_documents(
-    folder_id: int | None = Query(None, description="폴더 ID 필터"),
-    category: str | None = Query(None, description="(예약) 카테고리 필터"),
-    source_type: str | None = Query(None, description="출처 유형 필터"),
+    folder_id: int | None = Query(None, description="?대뜑 ID ?꾪꽣"),
+    category: str | None = Query(None, description="(?덉빟) 移댄뀒怨좊━ ?꾪꽣"),
+    source_type: str | None = Query(None, description="異쒖쿂 ?좏삎 ?꾪꽣"),
 ) -> JSONResponse:
     """
-    데모 사용자(`user_id=1`)의 활성 문서 목록을 반환한다.
+    ?곕え ?ъ슜??`user_id=1`)???쒖꽦 臾몄꽌 紐⑸줉??諛섑솚?쒕떎.
 
-    "활성" = soft-delete 되지 않은 (deleted_at IS NULL) 문서.
+    "?쒖꽦" = soft-delete ?섏? ?딆? (deleted_at IS NULL) 臾몄꽌.
 
-    명세 [BE1 - Documents API] 쿼리 파라미터:
-        folder_id?    : documents.folder_id 일치 필터.
-        category?     : (예약) 현재 schema 에 컬럼 없음 → 받기만 하고 무시. TODO.
-        source_type?  : documents.source_type 일치 필터.
+    紐낆꽭 [BE1 - Documents API] 荑쇰━ ?뚮씪誘명꽣:
+        folder_id?    : documents.folder_id ?쇱튂 ?꾪꽣.
+        category?     : (?덉빟) ?꾩옱 schema ??而щ읆 ?놁쓬 ??諛쏄린留??섍퀬 臾댁떆. TODO.
+        source_type?  : documents.source_type ?쇱튂 ?꾪꽣.
 
-    응답 data 는 각 문서별 dict 들의 리스트.
+    ?묐떟 data ??媛?臾몄꽌蹂?dict ?ㅼ쓽 由ъ뒪??
     """
     try:
         documents = document_service.list_documents(
@@ -209,36 +262,183 @@ async def list_documents(
         )
     except Exception as exc:  # noqa: BLE001
         return _error_response(
-            message=f"문서 목록 조회 중 오류가 발생했습니다: {exc}",
+            message=f"臾몄꽌 紐⑸줉 議고쉶 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {exc}",
             code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    # 명세에 맞춰 data 를 {documents: [...]} 로 nest 하지 않고 list 직접 반환 유지.
-    # (현 라우트의 응답 자료형이 documents[] 자체이므로 명세 "data: documents[]" 와 일치.)
+    # 紐낆꽭??留욎떠 data 瑜?{documents: [...]} 濡?nest ?섏? ?딄퀬 list 吏곸젒 諛섑솚 ?좎?.
+    # (???쇱슦?몄쓽 ?묐떟 ?먮즺?뺤씠 documents[] ?먯껜?대?濡?紐낆꽭 "data: documents[]" ? ?쇱튂.)
     return _success_response(documents, status_code=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------
-# 엔드포인트: 단일 문서 조회
+# ?붾뱶?ъ씤?? ?⑥씪 臾몄꽌 議고쉶
 # ---------------------------------------------------------------------------
+
+SHARED_EXPORT_DIR = Path(document_service.BACKEND_DIR) / "shared_exports"
+
+
+def _safe_download_name(filename: str | None) -> str:
+    name = Path(filename or "shared-document.hwpx").name
+    return name or "shared-document.hwpx"
+
+
+@router.post("/share-link")
+async def create_share_link(file: UploadFile | None = File(default=None)) -> JSONResponse:
+    """Store a temporary exported document and return an API URL that can be shared."""
+    if file is None:
+        return _error_response(
+            message="공유할 파일이 없습니다.",
+            code="MISSING_FILE",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        content = await file.read()
+        if not content:
+            return _error_response(
+                message="빈 파일은 공유할 수 없습니다.",
+                code="EMPTY_FILE",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        SHARED_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        filename = _safe_download_name(file.filename)
+        stored_path = SHARED_EXPORT_DIR / f"{token}_{filename}"
+        stored_path.write_bytes(content)
+
+        return _success_response(
+            {
+                "token": token,
+                "filename": filename,
+                "url": f"/api/documents/shared/{token}",
+            },
+            status_code=status.HTTP_201_CREATED,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"공유 링크를 만들지 못했습니다: {exc}",
+            code="SHARE_LINK_FAILED",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@router.get("/shared/{token}")
+async def get_shared_export(token: str):
+    """Download a temporary shared export by token."""
+    try:
+        if not token or not all(ch in "0123456789abcdef" for ch in token.lower()):
+            return _error_response(
+                message="공유 링크가 올바르지 않습니다.",
+                code="INVALID_SHARE_TOKEN",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        matches = list(SHARED_EXPORT_DIR.glob(f"{token}_*"))
+        if not matches:
+            return _error_response(
+                message="공유 파일을 찾을 수 없습니다.",
+                code="SHARED_FILE_NOT_FOUND",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        path = matches[0]
+        filename = path.name.split("_", 1)[1] if "_" in path.name else path.name
+        return FileResponse(
+            path=path,
+            filename=filename,
+            media_type="application/octet-stream",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"공유 파일을 불러오지 못했습니다: {exc}",
+            code="SHARED_FILE_LOAD_FAILED",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+@router.get("/{document_id}/file")
+async def get_document_file(document_id: int):
+    """Return the stored original file for the editor viewer."""
+    try:
+        info = document_service.get_document_file_info(
+            document_id=document_id, user_id=DEMO_USER_ID
+        )
+        backend_dir = Path(document_service.BACKEND_DIR)
+        file_path = backend_dir / info["file_path"]
+        if not file_path.exists() or not file_path.is_file():
+            return _error_response(
+                message="??? ?? ??? ?? ? ????.",
+                code="FILE_NOT_FOUND",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return FileResponse(
+            path=file_path,
+            filename=info["original_filename"] or f"document-{document_id}",
+            media_type=info["content_type"],
+        )
+    except DocumentNotFoundError as exc:
+        return _error_response(
+            message=str(exc),
+            code="NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"?? ?? ?? ? ??? ??????: {exc}",
+            code="INTERNAL_SERVER_ERROR",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@router.put("/{document_id}/file")
+async def replace_document_file(document_id: int, file: UploadFile = File(...)):
+    """Replace the stored HWPX file after AI editing."""
+    try:
+        result = await document_service.replace_document_file(
+            document_id=document_id,
+            user_id=DEMO_USER_ID,
+            file=file,
+        )
+        return _success_response(result, status_code=status.HTTP_200_OK)
+    except DocumentNotFoundError as exc:
+        return _error_response(
+            message=str(exc),
+            code="NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    except EmptyFileError as exc:
+        return _error_response(
+            message=str(exc),
+            code="EMPTY_FILE",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"??? ?? ?? ??? ??????: {exc}",
+            code="INTERNAL_SERVER_ERROR",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
 @router.get("/{document_id}")
 async def get_document(document_id: int) -> JSONResponse:
     """
-    데모 사용자의 단일 문서를 조회한다.
+    ?곕え ?ъ슜?먯쓽 ?⑥씪 臾몄꽌瑜?議고쉶?쒕떎.
 
-    document_texts 에 해당 문서의 텍스트가 있으면 extracted_text 를 함께 반환하고,
-    없으면 null 로 채워 명세를 만족시킨다.
+    document_texts ???대떦 臾몄꽌???띿뒪?멸? ?덉쑝硫?extracted_text 瑜??④퍡 諛섑솚?섍퀬,
+    ?놁쑝硫?null 濡?梨꾩썙 紐낆꽭瑜?留뚯”?쒗궓??
 
     Args:
-        document_id: 경로 파라미터. FastAPI 가 int 로 자동 캐스팅하며 실패 시 422 가 뜨지만,
-            현재 라우터에서 422 를 명세 형식으로 변환하는 로직은 없다.
-            (TODO: main.py 에 RequestValidationError exception_handler 등록 필요)
+        document_id: 寃쎈줈 ?뚮씪誘명꽣. FastAPI 媛 int 濡??먮룞 罹먯뒪?낇븯硫??ㅽ뙣 ??422 媛 ?⑥?留?
+            ?꾩옱 ?쇱슦?곗뿉??422 瑜?紐낆꽭 ?뺤떇?쇰줈 蹂?섑븯??濡쒖쭅? ?녿떎.
+            (TODO: main.py ??RequestValidationError exception_handler ?깅줉 ?꾩슂)
 
     Returns:
-        - 200 + {"success": true, "data": {...}}: 정상
-        - 404 + {"success": false, "data": {"code":"DOCUMENT_NOT_FOUND", ...}}: 미존재/소유권 불일치/삭제됨
-        - 500 + 명세 형식 에러: 예기치 못한 오류
+        - 200 + {"success": true, "data": {...}}: ?뺤긽
+        - 404 + {"success": false, "data": {"code":"DOCUMENT_NOT_FOUND", ...}}: 誘몄〈???뚯쑀沅?遺덉씪移???젣??
+        - 500 + 紐낆꽭 ?뺤떇 ?먮윭: ?덇린移?紐삵븳 ?ㅻ쪟
     """
     try:
         document = document_service.get_document(
@@ -252,7 +452,7 @@ async def get_document(document_id: int) -> JSONResponse:
         )
     except Exception as exc:  # noqa: BLE001
         return _error_response(
-            message=f"문서 조회 중 오류가 발생했습니다: {exc}",
+            message=f"臾몄꽌 議고쉶 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {exc}",
             code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
@@ -261,33 +461,33 @@ async def get_document(document_id: int) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# 요청 본문 스키마 (Pydantic)
+# ?붿껌 蹂몃Ц ?ㅽ궎留?(Pydantic)
 # ---------------------------------------------------------------------------
-# PUT /api/documents/{document_id}/text 의 요청 본문 모델.
-# Pydantic 이 자동으로 JSON 파싱·필드 존재·타입 검증을 처리해준다.
-# 다만 실패 시 FastAPI 는 422 + {"detail": [...]} 형식의 기본 응답을 반환하므로,
-# 본 응답이 명세("{success, data}")와 어긋나는 점은 알려진 트레이드오프.
-# (TODO: main.py 에 RequestValidationError 핸들러를 등록하면 명세 형식으로 통일 가능.)
+# PUT /api/documents/{document_id}/text ???붿껌 蹂몃Ц 紐⑤뜽.
+# Pydantic ???먮룞?쇰줈 JSON ?뚯떛쨌?꾨뱶 議댁옱쨌???寃利앹쓣 泥섎━?댁???
+# ?ㅻ쭔 ?ㅽ뙣 ??FastAPI ??422 + {"detail": [...]} ?뺤떇??湲곕낯 ?묐떟??諛섑솚?섎?濡?
+# 蹂??묐떟??紐낆꽭("{success, data}")? ?닿툔?섎뒗 ?먯? ?뚮젮吏??몃젅?대뱶?ㅽ봽.
+# (TODO: main.py ??RequestValidationError ?몃뱾?щ? ?깅줉?섎㈃ 紐낆꽭 ?뺤떇?쇰줈 ?듭씪 媛??)
 class UpdateDocumentTextRequest(BaseModel):
-    """PUT /api/documents/{document_id}/text 요청 바디."""
+    """PUT /api/documents/{document_id}/text ?붿껌 諛붾뵒."""
 
     edited_text: str
 
 
 class ReindexDocumentRequest(BaseModel):
-    """POST /api/documents/{document_id}/reindex 요청 바디.
+    """POST /api/documents/{document_id}/reindex ?붿껌 諛붾뵒.
 
-    명세 [BE1 - Documents API] reindex 요청: {force: boolean}.
-    force=False 면 이미 텍스트가 있을 때 재처리를 생략하고 현재 상태를 반환,
-    force=True 면 강제로 text_version 을 +1 하고 updated_at 을 갱신해 "재인덱싱"
-    효과를 시뮬레이션한다.
+    紐낆꽭 [BE1 - Documents API] reindex ?붿껌: {force: boolean}.
+    force=False 硫??대? ?띿뒪?멸? ?덉쓣 ???ъ쿂由щ? ?앸왂?섍퀬 ?꾩옱 ?곹깭瑜?諛섑솚,
+    force=True 硫?媛뺤젣濡?text_version ??+1 ?섍퀬 updated_at ??媛깆떊??"?ъ씤?깆떛"
+    ?④낵瑜??쒕??덉씠?섑븳??
     """
 
     force: bool = False
 
 
 # ---------------------------------------------------------------------------
-# 엔드포인트: 문서 텍스트 수정 (버전 이력 기록)
+# ?붾뱶?ъ씤?? 臾몄꽌 ?띿뒪???섏젙 (踰꾩쟾 ?대젰 湲곕줉)
 # ---------------------------------------------------------------------------
 @router.put("/{document_id}/text")
 async def update_document_text(
@@ -295,28 +495,28 @@ async def update_document_text(
     body: UpdateDocumentTextRequest,
 ) -> JSONResponse:
     """
-    문서 본문 텍스트를 수정한다.
+    臾몄꽌 蹂몃Ц ?띿뒪?몃? ?섏젙?쒕떎.
 
-    요청:
+    ?붿껌:
         PUT /api/documents/{document_id}/text
-        Body: {"edited_text": "수정된 문서 텍스트"}  ← UpdateDocumentTextRequest 로 검증
+        Body: {"edited_text": "?섏젙??臾몄꽌 ?띿뒪??}  ??UpdateDocumentTextRequest 濡?寃利?
 
-    처리:
-        1) Pydantic 이 본문을 UpdateDocumentTextRequest 인스턴스로 자동 파싱·검증
-        2) service.update_document_text 호출 → DB 4단계 작업 위임
-        3) 결과를 명세 형식으로 감싸 응답
+    泥섎━:
+        1) Pydantic ??蹂몃Ц??UpdateDocumentTextRequest ?몄뒪?댁뒪濡??먮룞 ?뚯떛쨌寃利?
+        2) service.update_document_text ?몄텧 ??DB 4?④퀎 ?묒뾽 ?꾩엫
+        3) 寃곌낵瑜?紐낆꽭 ?뺤떇?쇰줈 媛먯떥 ?묐떟
 
-    응답 data:
+    ?묐떟 data:
         - document_text_id, version_id, version_no, updated_at
 
-    상태 코드:
-        - 200: 성공
-        - 422: Pydantic 본문 검증 실패 (FastAPI 기본 응답 — 명세 형식 아님)
-        - 404: 문서 없음/소유권 불일치/삭제됨
-        - 500: 예기치 못한 서버 오류
+    ?곹깭 肄붾뱶:
+        - 200: ?깃났
+        - 422: Pydantic 蹂몃Ц 寃利??ㅽ뙣 (FastAPI 湲곕낯 ?묐떟 ??紐낆꽭 ?뺤떇 ?꾨떂)
+        - 404: 臾몄꽌 ?놁쓬/?뚯쑀沅?遺덉씪移???젣??
+        - 500: ?덇린移?紐삵븳 ?쒕쾭 ?ㅻ쪟
     """
 
-    # ---- 비즈니스 로직 위임 ----
+    # ---- 鍮꾩쫰?덉뒪 濡쒖쭅 ?꾩엫 ----
     try:
         result = document_service.update_document_text(
             document_id=document_id,
@@ -332,17 +532,17 @@ async def update_document_text(
         )
     except Exception as exc:  # noqa: BLE001
         return _error_response(
-            message=f"문서 텍스트 수정 중 오류가 발생했습니다: {exc}",
+            message=f"臾몄꽌 ?띿뒪???섏젙 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {exc}",
             code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    # ---- 성공 응답 ----
+    # ---- ?깃났 ?묐떟 ----
     return _success_response(result, status_code=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------
-# 엔드포인트: 문서 재인덱싱
+# ?붾뱶?ъ씤?? 臾몄꽌 ?ъ씤?깆떛
 # ---------------------------------------------------------------------------
 @router.post("/{document_id}/reindex")
 async def reindex_document(
@@ -350,18 +550,18 @@ async def reindex_document(
     body: ReindexDocumentRequest,
 ) -> JSONResponse:
     """
-    문서 텍스트/필드를 재인덱싱한다.
+    臾몄꽌 ?띿뒪???꾨뱶瑜??ъ씤?깆떛?쒕떎.
 
-    명세 [BE1 - Documents API] POST /api/documents/{id}/reindex:
-        요청: {force: boolean}
-        응답: data = {document_texts: <갱신 후 dict>, fields: [...]}.
+    紐낆꽭 [BE1 - Documents API] POST /api/documents/{id}/reindex:
+        ?붿껌: {force: boolean}
+        ?묐떟: data = {document_texts: <媛깆떊 ??dict>, fields: [...]}.
 
-    동작:
-        - force=False: document_texts 가 있으면 현재 상태 그대로 반환 (재처리 생략).
-        - force=True : document_texts.text_version 을 +1 하고 updated_at 을 갱신해
-                       재인덱싱 효과를 시뮬레이션 (실제 OCR 재실행은 본 PR 범위 외).
+    ?숈옉:
+        - force=False: document_texts 媛 ?덉쑝硫??꾩옱 ?곹깭 洹몃?濡?諛섑솚 (?ъ쿂由??앸왂).
+        - force=True : document_texts.text_version ??+1 ?섍퀬 updated_at ??媛깆떊??
+                       ?ъ씤?깆떛 ?④낵瑜??쒕??덉씠??(?ㅼ젣 OCR ?ъ떎?됱? 蹂?PR 踰붿쐞 ??.
 
-    fields 는 schema 부재로 빈 배열 반환 (TODO).
+    fields ??schema 遺?щ줈 鍮?諛곗뿴 諛섑솚 (TODO).
     """
     try:
         result = document_service.reindex_document(
@@ -377,9 +577,11 @@ async def reindex_document(
         )
     except Exception as exc:  # noqa: BLE001
         return _error_response(
-            message=f"문서 재인덱싱 중 오류가 발생했습니다: {exc}",
+            message=f"臾몄꽌 ?ъ씤?깆떛 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎: {exc}",
             code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
     return _success_response(result, status_code=status.HTTP_200_OK)
+
+

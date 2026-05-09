@@ -265,6 +265,7 @@ async def upload_document(
     # ---- 1단계: 파일명/확장자 검증 ----
     # `file.filename` 은 클라이언트가 보낸 원본 이름. 누락 시 'unnamed' 로 대체.
     original_filename = file.filename or "unnamed"
+    display_title = title or Path(original_filename).stem
     # `Path(...).suffix` 는 ".hwpx" 처럼 점을 포함한 확장자를 반환.
     # 대소문자 무시 비교를 위해 lower() 적용.
     extension = Path(original_filename).suffix.lower()
@@ -313,8 +314,8 @@ async def upload_document(
             INSERT INTO documents (
                 user_id, original_filename, stored_filename, file_path,
                 file_extension, file_size, content_type, created_at,
-                title, source_type, folder_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                title, source_type, parse_status, folder_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -325,8 +326,9 @@ async def upload_document(
                 file_size,
                 file.content_type,
                 created_at,
-                title,
+                display_title,
                 source_type,
+                "pending",
                 folder_id,
             ),
         )
@@ -352,7 +354,7 @@ async def upload_document(
         "file_size": file_size,
         "content_type": file.content_type,
         "created_at": created_at,
-        "title": title,
+        "title": display_title,
         "source_type": source_type,
         "folder_id": folder_id,
     }
@@ -408,7 +410,8 @@ def list_documents(
     return [
         {
             "id": row["id"],
-            "title": row["title"],
+            "title": row["title"] or Path(row["original_filename"]).stem,
+            "original_filename": row["original_filename"],
             "source_type": row["source_type"],
             "file_type": row["file_extension"],
             "parse_status": row["parse_status"],
@@ -470,7 +473,8 @@ def get_document(document_id: int, user_id: int) -> dict:
     return {
         "metadata": {
             "id": row["id"],
-            "title": row["title"],
+            "title": row["title"] or Path(row["original_filename"]).stem,
+            "original_filename": row["original_filename"],
             "source_type": row["source_type"],
             "file_type": row["file_extension"],
             "parse_status": row["parse_status"],
@@ -490,6 +494,66 @@ def get_document(document_id: int, user_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # 텍스트 수정 서비스 함수 (PUT /api/documents/{id}/text)
 # ---------------------------------------------------------------------------
+
+
+def get_document_file_info(document_id: int, user_id: int) -> dict:
+    """Return original file information for download/viewer loading."""
+    from app.repositories import document_repository
+
+    row = document_repository.get_document_with_latest_text(
+        document_id=document_id, user_id=user_id
+    )
+    if row is None:
+        raise DocumentNotFoundError(
+            f"?? #{document_id} ? ?? ? ????."
+        )
+
+    return {
+        "id": row["id"],
+        "title": row["title"] or Path(row["original_filename"]).stem,
+        "original_filename": row["original_filename"],
+        "file_path": row["file_path"],
+        "content_type": row.get("content_type") or "application/octet-stream",
+    }
+
+
+async def replace_document_file(document_id: int, user_id: int, file: UploadFile) -> dict:
+    """Replace the stored HWPX file for an existing document."""
+    info = get_document_file_info(document_id=document_id, user_id=user_id)
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise EmptyFileError("? ??? ??? ? ????.")
+
+    file_path = BACKEND_DIR / info["file_path"]
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(file_bytes)
+
+    updated_at = datetime.now(timezone.utc).isoformat()
+    content_type = file.content_type or info["content_type"] or "application/octet-stream"
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE documents
+            SET file_size = ?,
+                content_type = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+              AND deleted_at IS NULL
+            """,
+            (len(file_bytes), content_type, updated_at, document_id, user_id),
+        )
+        conn.commit()
+
+    return {
+        "id": document_id,
+        "file_size": len(file_bytes),
+        "content_type": content_type,
+        "updated_at": updated_at,
+    }
+
+
 def update_document_text(
     document_id: int,
     edited_text: str,

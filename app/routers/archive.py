@@ -139,7 +139,7 @@ def _group_local_documents_by_folder(rows: list[dict]) -> list[dict]:
         # 명세 요구 카드 필드만 추려 노출.
         card = {
             "id": row["id"],
-            "title": row["title"],
+            "title": row["title"] or (row.get("original_filename") or f"?? {row['id']}").rsplit(".", 1)[0],
             "source_type": row["source_type"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
