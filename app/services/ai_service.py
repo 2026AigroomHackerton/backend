@@ -165,15 +165,66 @@ EditOperation JSON 객체를 만든다.
 """
 
 
+def _fetch_document_text(db: Any, document_id: str) -> str | None:
+    """document_id 로 document_texts.extracted_text 최신본을 조회.
+
+    Args:
+        db: SQLAlchemy Session. None 이면 즉시 None 반환 (graceful).
+        document_id: 클라이언트가 보낸 식별자. 본 라우트는 string 으로 받지만
+            documents.id 는 INTEGER 이므로 int 캐스팅을 시도한다.
+
+    Returns:
+        본문 텍스트. 다음 케이스에서 None:
+            - db=None
+            - document_id 가 정수 캐스팅 불가
+            - document_texts 행이 없음
+            - 조회 중 예외 (graceful 폴백)
+    """
+    if db is None:
+        return None
+
+    # documents.id 는 INTEGER PK. string → int 변환 실패는 폴백 사유.
+    try:
+        doc_id_int = int(document_id)
+    except (TypeError, ValueError):
+        logger.warning("document_id 가 정수가 아님 → 본문 조회 생략: %r", document_id)
+        return None
+
+    try:
+        from sqlalchemy import text as _sql_text  # type: ignore
+
+        row = db.execute(
+            _sql_text(
+                "SELECT extracted_text FROM document_texts "
+                "WHERE document_id = :doc_id "
+                "ORDER BY text_version DESC, id DESC LIMIT 1"
+            ),
+            {"doc_id": doc_id_int},
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 — 조회 실패도 폴백
+        logger.warning("document_texts 조회 실패 → 본문 없이 진행: %s", exc)
+        return None
+
+    if row is None:
+        return None
+    # SQLAlchemy 1.x/2.x 모두 호환되는 위치 인덱스 접근.
+    return row[0] if row[0] is not None else None
+
+
 def _call_openai_for_edit(
     document_id: str,
     command_text: str,
     scope: str,
+    document_text: str | None = None,
 ) -> dict[str, Any]:
     """OpenAI Chat Completions 로 EditOperation dict 를 생성한다.
 
     [내부 함수]
         generate_edit_plan() 에서만 호출. 외부에서 직접 부르지 말 것.
+
+    Args:
+        document_id / command_text / scope: 라우터 입력 그대로.
+        document_text: DB 에서 조회한 실제 문서 본문. None 이면 prompt 에서 생략.
 
     Raises:
         Exception: OpenAI 호출 실패, JSON 파싱 실패 등. 호출자가 폴백 처리.
@@ -184,14 +235,25 @@ def _call_openai_for_edit(
     if client is None:
         raise RuntimeError("OpenAI client is not configured")
 
-    # 사용자 입력은 그대로 user 메시지로 전달.
-    # f-string 으로 합치되, command_text 에 줄바꿈/특수문자가 들어와도
-    # JSON 응답을 깨뜨리지 않는다 (모델이 JSON 출력만 하도록 시스템 프롬프트로 강제).
-    user_msg = (
-        f"document_id: {document_id}\n"
-        f"scope: {scope}\n"
-        f"command_text: {command_text}"
-    )
+    # user 메시지 구성. 본문이 있으면 함께 넣어 모델이 실제 텍스트를 보고
+    # 의미 있는 before_text/after_text 를 만들도록 한다.
+    parts = [
+        f"document_id: {document_id}",
+        f"scope: {scope}",
+        f"command_text: {command_text}",
+    ]
+    if document_text:
+        # prompt 토큰 비용 보호를 위해 너무 긴 본문은 적당히 자른다.
+        # 가정통신문/회의록 수준이면 8000자로 충분.
+        MAX_DOC_CHARS = 8000
+        body = (
+            document_text
+            if len(document_text) <= MAX_DOC_CHARS
+            else document_text[:MAX_DOC_CHARS] + "\n... [truncated]"
+        )
+        parts.append("---\ndocument_text (현재 본문):\n" + body)
+
+    user_msg = "\n".join(parts)
 
     # Chat Completions 호출.
     # - response_format={"type": "json_object"} : 모델이 반드시 JSON 으로만 응답.
@@ -221,6 +283,8 @@ def _call_openai_for_edit(
         "scope": scope,
         "_source": "openai",
         "_model": OPENAI_MODEL_TEXT,
+        # 본문 조회가 성공했는지 명시 — 디버깅에 유용.
+        "_document_text_found": document_text is not None,
     }
     return parsed
 
@@ -229,24 +293,38 @@ def generate_edit_plan(
     document_id: str,
     command_text: str,
     scope: str,
+    db: Any = None,
 ) -> dict[str, Any]:
     """공개 진입점: 실제 LLM 호출(가능하면) 또는 mock 응답을 반환.
+
+    [Fix B — 통합 단계 보강]
+        db 가 주입되면 document_id 로 document_texts 를 조회해 prompt 에 본문을
+        함께 넣는다. 조회 실패 / db=None 이어도 graceful 하게 본문 없이 진행한다.
 
     [폴백 정책]
         - OPENAI_API_KEY 가 없으면 mock 으로 즉시 폴백.
         - OpenAI 호출 중 예외가 나면 로그를 남기고 mock 으로 폴백.
           (해커톤 데모 중 네트워크/쿼터 문제로 데모가 멈추는 것을 방지)
 
-    Args/Returns:
-        generate_mock_edit_plan 과 동일한 시그니처.
+    Args:
+        document_id / command_text / scope: 라우터 입력.
+        db: SQLAlchemy Session 또는 None. 라우터에서 Depends(get_db) 로 주입.
     """
+    # 본문 조회 — db 가 None 이면 None 반환되어 prompt 에서 생략됨.
+    document_text = _fetch_document_text(db, document_id)
+
     # 키가 없으면 굳이 try 안 들어가고 바로 mock.
     if get_client() is None:
         return generate_mock_edit_plan(document_id, command_text, scope)
 
     # 키가 있으면 실제 호출 시도. 실패 시 mock 폴백.
     try:
-        return _call_openai_for_edit(document_id, command_text, scope)
+        return _call_openai_for_edit(
+            document_id=document_id,
+            command_text=command_text,
+            scope=scope,
+            document_text=document_text,
+        )
     except Exception as exc:  # noqa: BLE001 — 외부 호출은 모두 폴백 대상
         logger.warning("OpenAI 호출 실패 → mock 폴백: %s", exc)
         return generate_mock_edit_plan(document_id, command_text, scope)

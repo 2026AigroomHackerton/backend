@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, UploadFile, status
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -29,6 +31,15 @@ from app.services.ocr_service import (
     error_response,
     success_response,
 )
+
+# DB 의존성 주입 — storage.py 와 동일한 lazy import 폴백 패턴.
+# get_db 가 없으면 None 을 yield 하는 더미로 떨어져 service 가 INSERT 를 건너뜀.
+try:
+    from app.database import get_db  # type: ignore
+except ImportError:  # pragma: no cover - 모델 PR 머지 전 단계
+    def get_db():  # noqa: D401 — 더미 generator
+        """더미 get_db. None 을 yield 해 라우터가 db=None 으로 호출되게 한다."""
+        yield None
 
 
 # -----------------------------------------------------------------------------
@@ -76,6 +87,7 @@ def _envelope_response(payload: dict, http_status: int) -> JSONResponse:
 async def extract_ocr(
     image: UploadFile = File(..., description="모바일에서 촬영한 이미지 파일"),
     create_document: bool = Form(False, description="OCR 결과로 Document 생성 여부"),
+    db: Any = Depends(get_db),
 ):
     """이미지에서 텍스트를 추출한다 (실제 Vision + mock 폴백).
 
@@ -84,7 +96,9 @@ async def extract_ocr(
         2) save_image                → image_path 확보 (실패 시 HTTP 500)
         3) extract_text_from_image   → 텍스트/신뢰도 (엔진 미설치 시 HTTP 500)
         4) generate_ocr_id
-        5) DB 저장 (TODO) — 현재는 in-memory store
+        5) in-memory store 등록 (GET/{id}, /confirm 동작용)
+        6) create_document=True 면 documents + document_texts INSERT
+           → 응답 data.document_id 에 실제 PK 반환
     """
     # 1) MIME 검증
     try:
@@ -94,6 +108,10 @@ async def extract_ocr(
             error_response(error=exc.code, message=str(exc)),
             http_status=exc.http_status,
         )
+
+    # 원본 메타데이터 보존 — save_image 가 file.read() 를 소비하므로 사전 캡처.
+    original_filename = image.filename
+    content_type = image.content_type
 
     # 2) 디스크 저장 (실패 시 FILE_SAVE_FAILED)
     try:
@@ -120,27 +138,36 @@ async def extract_ocr(
     # 4) ID 발급
     ocr_source_id = ocr_service.generate_ocr_id()
 
-    # 5) in-memory store 등록 (TODO: 실제 ocr_sources 테이블 INSERT)
     extracted_text = ocr_result.get("text", "")
     confidence = float(ocr_result.get("confidence", 0.0))
+
+    # 5) in-memory store 등록
     ocr_service.remember(
         ocr_source_id=ocr_source_id,
         extracted_text=extracted_text,
         image_path=image_path,
     )
 
-    # create_document 는 명세상 받기만 한다. documents 도메인은 절대 수정 금지.
-    _ = create_document
+    # 6) create_document=True → documents + document_texts INSERT.
+    #    db=None 이거나 INSERT 실패 시 graceful 폴백 (document_id=None).
+    document_id: int | None = None
+    if create_document:
+        document_id = ocr_service.create_document_from_ocr(
+            db=db,
+            image_path=image_path,
+            extracted_text=extracted_text,
+            original_filename=original_filename,
+            content_type=content_type,
+        )
 
-    # 명세 응답 data 키 5종만 노출. _source/_model 등 디버깅 메타는 _ 접두로 함께 전달.
+    # 명세 응답 data 키 5종 + image_path. _source/_model 등 디버깅 메타는 _ 접두.
     data = {
         "ocr_source_id": ocr_source_id,
         "extracted_text": extracted_text,
         "confidence": confidence,
-        "document_id": None,
+        "document_id": document_id,
         "image_path": image_path,
     }
-    # 디버깅용 메타 — 명세 외 키이지만 underscore prefix 로 구분.
     if "_source" in ocr_result:
         data["_source"] = ocr_result["_source"]
     if "_model" in ocr_result:
