@@ -19,7 +19,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final
+from typing import Final, Iterator
 
 from fastapi import UploadFile
 
@@ -115,13 +115,19 @@ _init_db()
 
 
 @contextmanager
-def _connect() -> sqlite3.Connection:
+def _connect() -> Iterator[sqlite3.Connection]:
     """
     DB 연결을 컨텍스트 매니저로 감싸는 헬퍼.
 
     `with _connect() as conn:` 형식으로 사용하면
     블록을 빠져나갈 때 항상 close() 가 호출되므로 누수가 방지된다.
     `row_factory = sqlite3.Row` 설정으로, 결과 행을 dict 처럼 다룰 수 있다.
+
+    반환 타입은 `Iterator[sqlite3.Connection]` 으로 명시한다.
+    `@contextmanager` 가 붙은 함수는 내부적으로 yield 하는 제너레이터이며,
+    데코레이터가 이를 컨텍스트 매니저로 변환해준다.
+    따라서 함수 자체의 시그니처는 "Connection 을 yield 하는 제너레이터"여야 하고,
+    `with` 블록 안에서 받는 값(`as conn`)이 sqlite3.Connection 으로 올바르게 추론된다.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
