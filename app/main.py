@@ -20,6 +20,9 @@ FastAPI 앱 진입점.
 """
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import CORS_ORIGINS
 
 # 백엔드 2 라우터 — 모듈을 alias 로 import 한 뒤 .router 속성으로 접근.
 from app.routers import ocr as ocr_router
@@ -34,6 +37,14 @@ from app.routers import archive, documents
 app = FastAPI(
     title="AI Mobile Document Assistant API",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------

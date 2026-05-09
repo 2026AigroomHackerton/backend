@@ -45,6 +45,17 @@ OPENAI_MODEL_TEXT: str = os.getenv("OPENAI_MODEL_TEXT", "gpt-4o-mini")
 # Vision(OCR) 모델. gpt-4o-mini 도 이미지 입력을 지원.
 OPENAI_MODEL_VISION: str = os.getenv("OPENAI_MODEL_VISION", "gpt-4o-mini")
 
+# Comma-separated frontend origins allowed to call this API from browsers.
+# Example: https://frontend-pnyn.onrender.com,http://localhost:5173
+CORS_ORIGINS: list[str] = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "https://frontend-pnyn.onrender.com",
+    ).split(",")
+    if origin.strip()
+]
+
 
 def has_openai_key() -> bool:
     """OpenAI 호출이 실제 가능한지 여부.
