@@ -20,16 +20,20 @@ from __future__ import annotations
 # typing.Literal: input_type 같이 "정해진 문자열 집합"만 허용하고 싶을 때 사용
 from typing import Any, Literal
 
-# FastAPI 라우터 객체 + 쿼리 파라미터 선언용 헬퍼.
+# FastAPI 라우터 객체 + 파라미터 선언용 헬퍼.
 # APIRouter는 main.py에서 include_router()로 메인 앱에 부착될 수 있도록 분리해 둔다.
-from fastapi import APIRouter, Query
+# File/UploadFile : multipart 오디오 업로드(/transcribe) 처리에 사용.
+# status / JSONResponse : 400 응답을 공통 envelope 으로 직접 반환하기 위함.
+from fastapi import APIRouter, File, Query, UploadFile, status
+from fastapi.responses import JSONResponse
 
 # Pydantic의 BaseModel/Field는 요청·응답 스키마 정의와 검증·문서화를 담당한다.
 from pydantic import BaseModel, Field
 
 # 동일 패키지의 서비스 계층을 import. 라우터는 직접 로직을 짜지 않고
 # VoiceService 인스턴스의 메서드를 호출만 한다 (얇은 라우터 + 두꺼운 서비스 패턴).
-from app.services.voice_service import VoiceService
+# ALLOWED_AUDIO_CONTENT_TYPES : transcribe 라우트의 콘텐츠 타입 화이트리스트.
+from app.services.voice_service import ALLOWED_AUDIO_CONTENT_TYPES, VoiceService
 
 # 모듈-수준 싱글톤 인스턴스. stateless Mock 서비스이므로 한 번 만들어 재사용.
 # 변수명을 `voice_service` 로 두어 호출 사이트(`voice_service.create_voice_command(...)`)는
@@ -96,6 +100,24 @@ def _ok(data: Any, message: str = "") -> dict:
     return {"success": True, "data": data, "message": message, "error": None}
 
 
+def _bad_request(message: str, error: str) -> JSONResponse:
+    """
+    공통 envelope 형식의 400 응답.
+
+    HTTPException 은 기본적으로 {"detail": ...} 라 envelope 와 어긋나므로
+    JSONResponse 로 직접 status_code + body 를 지정한다.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "success": False,
+            "data": None,
+            "message": message,
+            "error": error,
+        },
+    )
+
+
 # -----------------------------------------------------------------------------
 # 엔드포인트: 명령 생성
 # -----------------------------------------------------------------------------
@@ -140,3 +162,33 @@ def list_commands(
     # 응답 data 에는 어떤 문서를 조회했는지(document_id)도 함께 실어 준다.
     # 클라이언트가 다중 요청을 병렬 전송할 때 응답 매칭이 쉬워진다.
     return _ok({"document_id": document_id, "items": items})
+
+
+# -----------------------------------------------------------------------------
+# 엔드포인트: 음성 → 텍스트 (STT)
+# -----------------------------------------------------------------------------
+# POST /api/voice/transcribe
+# - multipart/form-data 로 오디오 파일을 받아 텍스트로 변환.
+# - real path: OpenAI Whisper API. mock fallback: 더미 transcript.
+# - 콘텐츠 타입이 ALLOWED_AUDIO_CONTENT_TYPES 에 없으면 400 + envelope 에러.
+@router.post("/transcribe", status_code=status.HTTP_200_OK)
+async def transcribe_voice(
+    audio: UploadFile = File(..., description="음성 파일 (mp3/m4a/wav/webm/ogg/flac)"),
+) -> Any:
+    """음성 파일을 텍스트로 변환한다 (STT).
+
+    공통 응답 포맷: {success, data, message, error}.
+    - data.transcript     : 변환된 텍스트
+    - data.audio_filename : 업로드된 파일명
+    - data._source        : "openai_whisper" | "mock" | "mock_fallback"
+    """
+    # 콘텐츠 타입 화이트리스트 검증.
+    # UploadFile.content_type 은 클라이언트가 보낸 MIME (스푸핑 가능하지만 1차 방어선).
+    if audio.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
+        return _bad_request(
+            message="지원하지 않는 오디오 형식입니다.",
+            error=f"unsupported_content_type: {audio.content_type!r}",
+        )
+
+    data = await voice_service.transcribe_audio(audio_file=audio)
+    return _ok(data, message="음성 인식이 완료되었습니다.")
