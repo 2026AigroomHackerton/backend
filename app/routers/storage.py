@@ -27,8 +27,9 @@ from typing import Any
 
 # FastAPI 핵심.
 #  - APIRouter : 엔드포인트 묶음.
+#  - Depends   : 의존성 주입 (DB 세션 전달용).
 #  - status    : HTTP 상태 코드 상수 (HTTP_400_BAD_REQUEST, HTTP_501_NOT_IMPLEMENTED 등).
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
 # JSONResponse: 비-200 응답 본문을 공통 envelope 형식으로 직접 만들 때 사용.
 # (HTTPException 은 {"detail": "..."} 형식이라 envelope 와 충돌)
@@ -41,6 +42,29 @@ from pydantic import BaseModel, Field
 
 # 비즈니스 로직 클래스.
 from app.services.storage_service import StorageService
+
+
+# -----------------------------------------------------------------------------
+# DB 의존성 주입
+# -----------------------------------------------------------------------------
+# 명세 [DB 의존성 주입] : "db: Session = Depends(get_db) 를 mock-import 에 주입.
+#   get_db 없으면 TODO 주석만 남기고 db 파라미터 없이 임시 구현".
+#
+# 본 PR 은 storage.py / storage_service.py 외 파일을 못 건드리므로
+# 다음 전략을 취한다:
+#   1) `app.database.get_db` 를 lazy import 시도.
+#   2) ImportError 면 동일 시그니처의 더미 generator 함수로 폴백 → None 을 yield.
+#   3) Depends(get_db) 는 그대로 쓰되, 더미 환경에서는 db=None 이 주입된다.
+#   4) 서비스 레이어가 db=None 분기를 이미 처리한다.
+try:
+    # 백엔드 1 이 작성할 가능성이 큰 표준 위치들. 모두 ImportError 면 더미 사용.
+    from app.database import get_db  # type: ignore  # noqa: F401
+except ImportError:  # pragma: no cover - 모델 PR 머지 전 단계
+    # TODO: 팀장에게 app/database.py + get_db (SQLAlchemy SessionLocal) 추가 요청.
+    #   get_db 가 추가되면 위 import 가 성공하므로 본 더미 분기는 자동 비활성화.
+    def get_db():  # noqa: D401 — 더미 generator
+        """더미 get_db. None 을 yield 해 라우터가 db=None 으로 호출되게 한다."""
+        yield None
 
 
 # -----------------------------------------------------------------------------
@@ -121,7 +145,14 @@ def _not_implemented(message: str) -> JSONResponse:
 # =============================================================================
 # 클라이언트가 "어떤 임포트 옵션이 있는가" 를 표시할 때 호출.
 # response 의 data 는 {"providers": [...]} 형태로 nest 한다 (명세).
-@router.get("/api/storage/providers", status_code=status.HTTP_200_OK)
+@router.get(
+    "/api/storage/providers",
+    status_code=status.HTTP_200_OK,
+    summary="연결 가능한 외부 저장소 목록 조회",
+    description=(
+        "Google Drive, Notion, 로컬, 샘플 문서 등 연결 가능한 저장소 목록을 반환합니다."
+    ),
+)
 def get_providers() -> dict[str, Any]:
     """임포트 가능한 provider 목록을 반환한다.
 
@@ -136,7 +167,12 @@ def get_providers() -> dict[str, Any]:
 # =============================================================================
 # OAuth 기반 외부 커넥터(google_drive/notion) 의 연결 상태를 반환한다.
 # 현재는 명세상 모두 disconnected.
-@router.get("/api/connectors", status_code=status.HTTP_200_OK)
+@router.get(
+    "/api/connectors",
+    status_code=status.HTTP_200_OK,
+    summary="현재 연결된 저장소 상태 조회",
+    description="각 외부 저장소의 현재 연결/해제 상태를 반환합니다.",
+)
 def get_connectors() -> dict[str, Any]:
     """OAuth 커넥터 연결 상태를 반환한다.
 
@@ -151,27 +187,42 @@ def get_connectors() -> dict[str, Any]:
 # =============================================================================
 # 샘플 문서를 documents/document_texts 에 삽입(또는 TODO 분기) 한다.
 # provider 가 "mock" 이 아니면 400 으로 거절.
-@router.post("/api/connectors/mock-import", status_code=status.HTTP_200_OK)
-async def mock_import(payload: MockImportRequest) -> Any:
+@router.post(
+    "/api/connectors/mock-import",
+    status_code=status.HTTP_200_OK,
+    summary="샘플 문서 임포트",
+    description=(
+        "데모용 샘플 문서(가정통신문/지원서/회의록)를 실제 DB에 생성합니다. "
+        "provider는 반드시 'mock'이어야 합니다."
+    ),
+)
+async def mock_import(
+    payload: MockImportRequest,
+    # Depends(get_db) — 실제 get_db 가 import 되면 SQLAlchemy Session 이,
+    # 더미 폴백이면 None 이 주입된다. 서비스가 두 케이스를 모두 처리한다.
+    db: Any = Depends(get_db),
+) -> Any:
     """샘플 문서를 임포트한다.
 
-    provider 가 "mock" 이 아닌 경우 HTTP 400.
-    document_type 이 SAMPLE_DOCUMENTS 에 없으면 서비스에서 "가정통신문" 으로 폴백.
+    명세 [라우터 ③]:
+        - request.provider != "mock" → HTTP 400 INVALID_PROVIDER.
+        - 그 외에는 storage_service.import_sample_document(db, document_type) 호출.
+        - 응답 data : {imported_document_id, title, source_type, extracted_text, status}
     """
     # ---- 1) provider 검증 ---------------------------------------------------
-    # 이 엔드포인트는 mock 전용. 다른 provider 가 들어오면 명시적으로 거절.
+    # 명세 에러 코드 INVALID_PROVIDER + 한국어 메시지 그대로.
     if payload.provider != "mock":
         return _bad_request(
-            message="provider 는 'mock' 이어야 합니다.",
-            error=f"invalid_provider: {payload.provider!r}",
+            message="mock provider만 지원합니다.",
+            error="INVALID_PROVIDER",
         )
 
     # ---- 2) 비즈니스 로직 호출 -----------------------------------------------
-    # TODO: db 세션 의존성 주입 (Depends(get_db))
-    #       현재는 DB 세션 팩토리가 아직 없어 None 으로 호출. 모델 PR 이후 활성화.
+    # db 가 None 이면 서비스가 INSERT 를 건너뛰고 imported_document_id=None 으로
+    # 응답한다. (TODO: 모델 PR 머지 후 자동으로 실 INSERT 경로 활성화)
     result = await storage_service.import_sample_document(
+        db=db,
         document_type=payload.document_type,
-        db=None,
     )
 
     # ---- 3) 공통 envelope 으로 감싸 반환 -------------------------------------
@@ -182,7 +233,11 @@ async def mock_import(payload: MockImportRequest) -> Any:
 # ④ POST /api/connectors/google-drive/import — stub
 # =============================================================================
 # OAuth 인증 흐름 미구현. 명세상 HTTP 501 + 안내 메시지.
-@router.post("/api/connectors/google-drive/import")
+@router.post(
+    "/api/connectors/google-drive/import",
+    summary="Google Drive 임포트 (준비 중)",
+    description="OAuth 인증 구현 후 활성화 예정입니다. 현재 501 반환.",
+)
 def google_drive_import_stub() -> JSONResponse:
     """Google Drive 임포트 stub (HTTP 501).
 
@@ -200,7 +255,11 @@ def google_drive_import_stub() -> JSONResponse:
 # ⑤ POST /api/connectors/notion/import — stub
 # =============================================================================
 # Integration Token 미설정. 명세상 HTTP 501 + 안내 메시지.
-@router.post("/api/connectors/notion/import")
+@router.post(
+    "/api/connectors/notion/import",
+    summary="Notion 임포트 (준비 중)",
+    description="Integration Token 설정 후 활성화 예정입니다. 현재 501 반환.",
+)
 def notion_import_stub() -> JSONResponse:
     """Notion 임포트 stub (HTTP 501).
 

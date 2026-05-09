@@ -64,7 +64,15 @@ def _envelope_response(payload: dict, http_status: int) -> JSONResponse:
 # -----------------------------------------------------------------------------
 # ① POST /api/ocr/extract — 명세 5단계 흐름
 # -----------------------------------------------------------------------------
-@router.post("/extract", status_code=status.HTTP_200_OK)
+@router.post(
+    "/extract",
+    status_code=status.HTTP_200_OK,
+    summary="이미지 OCR 텍스트 추출",
+    description=(
+        "이미지 파일을 업로드하면 pytesseract로 실제 OCR을 수행합니다. "
+        "한국어/영어 동시 인식(kor+eng). 서버에 Tesseract 설치 필요."
+    ),
+)
 async def extract_ocr(
     image: UploadFile = File(..., description="모바일에서 촬영한 이미지 파일"),
     create_document: bool = Form(False, description="OCR 결과로 Document 생성 여부"),
@@ -144,7 +152,12 @@ async def extract_ocr(
 # -----------------------------------------------------------------------------
 # ② GET /api/ocr/{ocr_source_id}
 # -----------------------------------------------------------------------------
-@router.get("/{ocr_source_id}", status_code=status.HTTP_200_OK)
+@router.get(
+    "/{ocr_source_id}",
+    status_code=status.HTTP_200_OK,
+    summary="OCR 결과 조회",
+    description="ocr_source_id로 저장된 OCR 결과를 조회합니다.",
+)
 def get_ocr_result(ocr_source_id: str):
     """OCR 결과 단건 조회. 미등록 ID 는 404 envelope 로 응답."""
     try:
@@ -160,7 +173,12 @@ def get_ocr_result(ocr_source_id: str):
 # -----------------------------------------------------------------------------
 # ③ POST /api/ocr/{ocr_source_id}/confirm
 # -----------------------------------------------------------------------------
-@router.post("/{ocr_source_id}/confirm", status_code=status.HTTP_200_OK)
+@router.post(
+    "/{ocr_source_id}/confirm",
+    status_code=status.HTTP_200_OK,
+    summary="OCR 결과 사용자 확정",
+    description="사용자가 수동 수정한 텍스트를 최종 확정합니다.",
+)
 def confirm_ocr_result(ocr_source_id: str, payload: OcrConfirmRequest):
     """사용자 수정본으로 확정. 미등록 ID 는 404 envelope 로 응답."""
     try:

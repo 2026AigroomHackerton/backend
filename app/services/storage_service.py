@@ -6,15 +6,21 @@
 
 [현 PR 범위 (해커톤 MVP)]
     - 로컬 파일 가져오기 : `save_uploaded_file()` 으로 실제 디스크 저장.
-    - 샘플 문서 임포트   : `import_sample_document()` 으로 샘플 텍스트 → DB INSERT.
+    - 샘플 문서 임포트   : `import_sample_document()` 으로 샘플 텍스트 → 실제 DB INSERT.
     - Google Drive       : stub (OAuth 미구현). 라우터에서 HTTP 501 응답 처리.
     - Notion             : stub (Integration Token 미설정). 라우터에서 HTTP 501.
 
-[DB 연동 정책]
-    documents / document_texts 모델은 "절대 수정 금지" 영역이라 실제 INSERT 코드를
-    이 PR 에서 작성하지 않는다. 대신 호출부에서 db 세션이 들어왔을 때를 대비한
-    분기와 TODO 주석을 남겨, 모델 PR 이 머지된 뒤 본 메서드 본문만 교체하면
-    바로 동작하도록 인터페이스를 안정화한다.
+[DB 연동 정책 — 기능 4]
+    documents / document_texts 모델은 "절대 수정 금지" 영역이라 ORM 클래스를
+    선언하지 않는다. 대신 SQLAlchemy `text()` 로 raw SQL INSERT 를 수행한다.
+    명세에 정해진 컬럼/값:
+        documents       : title, source_type='mock', file_type='txt',
+                          parse_status='done', owner_type='user', owner_id=1,
+                          created_at=datetime.utcnow().isoformat()
+        document_texts  : document_id, extracted_text, text_version=1,
+                          updated_at=datetime.utcnow().isoformat()
+    INSERT 가 실패(테이블 없음/컬럼 불일치 등) 하면 imported_document_id 를
+    None 으로 두고 응답은 그대로 반환 (서버 다운 금지).
 """
 
 # 타입 힌트 지연 평가. 함수 시그니처에 쓰는 타입을 미리 import 하지 않아도 되게 해 준다.
@@ -25,6 +31,9 @@ import logging
 
 # 디렉터리 자동 생성에 사용 (os.makedirs).
 import os
+
+# created_at / updated_at ISO8601 문자열 생성용.
+from datetime import datetime
 
 # 응답/내부 자료구조의 값 타입을 유연하게 두기 위한 Any.
 from typing import Any
@@ -188,6 +197,19 @@ class StorageService:
         Returns:
             {imported_document_id, title, source_type, extracted_text, status}
         """
+        # TODO: models.py에 아래 테이블 추가 필요 (팀장에게 요청):
+        # - ocr_sources: id, document_id, image_path, raw_text, cleaned_text, confidence, created_at
+        # - voice_commands: id, document_id, transcript, input_type, audio_path, status, created_at
+        # - documents: id, owner_type, owner_id, title, source_type, file_type, parse_status, created_at
+        # - document_texts: id, document_id, extracted_text, text_version, updated_at
+        # 위 테이블이 ORM 모델로 추가되면 raw SQL 대신 다음과 같이 교체:
+        #     doc = Document(title=title, source_type="mock", file_type="txt",
+        #                    parse_status="done", owner_type="user", owner_id=1)
+        #     db.add(doc); db.commit(); db.refresh(doc)
+        #     doc_text = DocumentText(document_id=doc.id, extracted_text=text,
+        #                             text_version=1)
+        #     db.add(doc_text); db.commit()
+        #     imported_document_id = doc.id
         # ---- 1) 샘플 lookup (없으면 기본값 "가정통신문") ------------------------
         sample = self.SAMPLE_DOCUMENTS.get(document_type) or self.SAMPLE_DOCUMENTS["가정통신문"]
         title: str = sample["title"]
@@ -196,32 +218,75 @@ class StorageService:
         # imported_document_id: 실제 DB INSERT 가 일어났을 때의 PK. 기본 None.
         imported_document_id: Any = None
 
-        # ---- 2) DB 세션이 있으면 INSERT 시도 ------------------------------------
+        # ---- 2) DB 세션이 있으면 실제 INSERT ------------------------------------
         if db is not None:
             try:
-                # TODO(실제 DB 연동):
-                #   documents 테이블 INSERT:
-                #       title=title, source_type="mock",
-                #       file_type="txt", parse_status="done"
-                #   document_texts 테이블 INSERT:
-                #       document_id=<위에서 생성된 id>, extracted_text=text
-                #   commit 후 생성된 document.id 를 imported_document_id 에 대입.
-                #
-                # documents 모델은 "절대 수정 금지" 영역이라 본 PR 에서 직접 작성하지 않는다.
-                # 모델 PR 이 머지된 뒤 이 블록 본문만 채우면 동작.
-                imported_document_id = None
+                # SQLAlchemy text() 로 raw SQL 실행.
+                # ORM 클래스를 선언하지 않는 이유: documents/document_texts 모델은
+                # "절대 수정 금지" 영역이라 본 파일에서 모델 클래스를 만들 수 없다.
+                # 대신 명세에 정해진 컬럼명을 그대로 SQL 에 박아 사용한다.
+                from sqlalchemy import text as _sql_text  # type: ignore
+
+                # ISO8601 문자열로 시간 일관성 유지 (명세 그대로).
+                now_iso = datetime.utcnow().isoformat()
+
+                # ----- documents INSERT -----------------------------------------
+                # RETURNING 은 SQLite 3.35+ 에서 지원. 하위 호환을 위해 lastrowid 사용.
+                doc_result = db.execute(
+                    _sql_text(
+                        "INSERT INTO documents "
+                        "(title, source_type, file_type, parse_status, "
+                        " owner_type, owner_id, created_at) "
+                        "VALUES (:title, 'mock', 'txt', 'done', "
+                        "        'user', 1, :created_at)"
+                    ),
+                    {"title": title, "created_at": now_iso},
+                )
+                # SQLAlchemy 의 CursorResult 는 lastrowid 속성을 제공.
+                imported_document_id = doc_result.lastrowid
+
+                # ----- document_texts INSERT -------------------------------------
+                # text_version=1 은 명세 고정값. updated_at 은 documents 와 같은 시점.
+                db.execute(
+                    _sql_text(
+                        "INSERT INTO document_texts "
+                        "(document_id, extracted_text, text_version, updated_at) "
+                        "VALUES (:document_id, :extracted_text, 1, :updated_at)"
+                    ),
+                    {
+                        "document_id": imported_document_id,
+                        "extracted_text": text,
+                        "updated_at": now_iso,
+                    },
+                )
+
+                # 두 INSERT 가 모두 성공한 시점에 한 번만 commit.
+                # (실패하면 except 절에서 rollback 처리.)
+                db.commit()
+
             except Exception as exc:  # noqa: BLE001 — INSERT 실패해도 임포트 자체는 응답
-                logger.warning("샘플 문서 DB INSERT 실패: %s", exc)
+                # TODO: 팀장에게 documents, document_texts 테이블 모델 확인 요청
+                #   현재 SQL 은 명세에 정의된 컬럼명/제약을 가정하고 작성했으나,
+                #   실제 모델과 컬럼/타입이 다를 수 있다. OperationalError 가 뜨면
+                #   본 except 가 잡아 rollback 후 mock 응답으로 폴백한다.
+                logger.warning("샘플 문서 DB INSERT 실패 → mock 폴백: %s", exc)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001 — rollback 자체 실패도 무시
+                    pass
                 imported_document_id = None
         else:
-            # TODO(실제 DB 연동):
-            #   라우터에서 db 의존성을 주입하도록 변경되면 위 블록이 활성화된다.
-            #   현재는 DB 세션 팩토리가 아직 없어 None 으로 호출됨.
+            # TODO: 팀장에게 database.py 와 get_db 의존성 추가 요청.
+            #   현재 라우터가 get_db 를 import 하지 못하면 db=None 으로 호출된다.
+            #   이 경우 임포트는 "성공으로 응답하되 PK 없음" 정책 (mock 폴백).
             imported_document_id = None
 
         # ---- 3) 응답 페이로드 ----------------------------------------------------
+        # imported_document_id 는 명세상 string 이므로 int → str 변환 (None 은 유지).
         return {
-            "imported_document_id": imported_document_id,
+            "imported_document_id": (
+                str(imported_document_id) if imported_document_id is not None else None
+            ),
             "title": title,
             "source_type": "mock",
             "extracted_text": text,
