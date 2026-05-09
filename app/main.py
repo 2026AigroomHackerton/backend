@@ -8,6 +8,10 @@ from app.routers import voice as voice_router
 # 백엔드 2: AI 문서 수정 라우터 (POST /api/ai/command-edit). 모듈 자체를
 # import 한 뒤 .router 속성으로 접근하는 패턴(팀 컨벤션, 위 ocr/storage 동일).
 from app.routers import ai as ai_router
+# [통합 테스트 임시] 백엔드 1: documents 라우터.
+# 본 등록 라인은 integration/sprint-1 (로컬 테스트 전용 폐기 브랜치) 에서만 추가됐다.
+# 정식으로는 백엔드 1 의 feature/backend-documents 측 main.py 에서 등록되어야 함.
+from app.routers import documents as documents_router
 
 app = FastAPI(
     title="AI Mobile Document Assistant API",
@@ -20,6 +24,8 @@ app.include_router(storage_router.router)
 app.include_router(voice_router.router)
 # 백엔드 2: AI 라우터 등록. 호출 후 /api/ai/* 엔드포인트가 노출된다.
 app.include_router(ai_router.router)
+# [통합 테스트 임시] documents 라우터 등록. /api/documents/* 노출.
+app.include_router(documents_router.router)
 
 
 @app.get("/")
