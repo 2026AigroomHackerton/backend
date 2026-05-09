@@ -7,7 +7,7 @@
 이 레포는 해커톤 MVP의 서버, API, 문서 처리, OCR/AI 연동, 데이터 저장 흐름을 담당합니다.
 추후 Python + FastAPI + SQLite 기반으로 구현할 예정입니다.
 
-현재 커밋은 실제 기능 코드 없이 팀원들이 작업을 시작할 수 있는 빈 폴더 구조와 협업 문서만 포함합니다.
+현재 레포는 FastAPI 기반의 최소 실행 환경과 협업용 폴더 구조를 포함합니다.
 
 ## 주요 구현 예정 범위
 
@@ -34,6 +34,40 @@
 - `docs`: 백엔드 관련 명세, 다이어그램, 회의록 관리 위치
 
 자세한 구조는 `docs/STRUCTURE.md`를 확인합니다.
+
+## 환경 세팅
+
+필요 환경:
+- Python 3.13 권장
+
+가상환경 생성:
+
+```bash
+python -m venv .venv
+```
+
+가상환경 활성화:
+
+```bash
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+```
+
+의존성 설치:
+
+```bash
+pip install -r requirements.txt
+```
+
+개발 서버 실행:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+기본 확인:
+- API 루트: `http://127.0.0.1:8000/`
+- Swagger 문서: `http://127.0.0.1:8000/docs`
 
 ## 작업 방법
 

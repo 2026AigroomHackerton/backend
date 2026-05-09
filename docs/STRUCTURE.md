@@ -22,6 +22,8 @@ backend/
     specs/
     diagrams/
     meeting-notes/
+  requirements.txt
+  .env.example
   .gitignore
   README.md
 ```
@@ -35,6 +37,7 @@ backend/
 - `app/schemas`: Pydantic 요청/응답 스키마 작성 위치
 - `app/utils`: 파일 처리, 텍스트 처리, 공통 응답 등 유틸 함수 위치
 - `app/core`: 환경 설정, CORS, 공통 설정 위치
+- `app/main.py`: FastAPI 앱 진입점. 현재는 서버 실행 확인용 최소 엔트리만 포함
 
 ## 저장소
 
@@ -50,3 +53,9 @@ backend/
 - `docs/specs`: 백엔드 API 명세, 데이터 모델 명세, 기능 정의서 보관 위치
 - `docs/diagrams`: 서버 아키텍처 구조도, DB ERD, API 흐름도 보관 위치
 - `docs/meeting-notes`: 백엔드 회의록, 의사결정 기록 보관 위치
+
+## 설정 파일
+
+- `requirements.txt`: 백엔드 Python 의존성 관리
+- `.env.example`: 로컬 환경 변수 예시
+- `.gitignore`: 가상환경, 캐시, 업로드 파일, DB 파일 제외 설정
