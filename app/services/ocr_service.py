@@ -1,26 +1,22 @@
 # [백엔드2 담당] 수정 허용 파일 - feature/backend-ocr-voice-storage 브랜치
-"""OCR Service (Class-based, real integration capable).
+"""OCR Service (명세 정렬 버전 — Vision 엔진 + Mock 폴백 유지).
 
 [책임]
     이미지 → 텍스트 추출 도메인의 비즈니스 로직 계층.
-    실제 OpenAI Vision OCR 경로와, 키/라이브러리/네트워크 사정으로 호출이 불가능할
-    때의 Mock 폴백 경로를 함께 제공한다.
+    OpenAI Vision 으로 실제 OCR 을 시도하고, 키/SDK/네트워크 사정으로 실패하면
+    명세 더미 텍스트로 자동 폴백한다.
 
-[real path]
-    - OPENAI_API_KEY 가 .env 에 있고 openai SDK 가 설치되어 있을 때 자동 활성화.
-    - 모델은 OPENAI_MODEL_VISION (기본 gpt-4o-mini) 을 사용.
+[명세 정렬 사항(2번 옵션)]
+    - 응답 스키마 / 에러 코드 / 헬퍼 위치를 [기능 2] 명세에 맞춤.
+    - 메서드를 명세 4단(validate_image / save_image / extract_text_from_image /
+      generate_ocr_id) 으로 분해하여 라우터가 명세 순서 그대로 호출 가능.
+    - ALLOWED_TYPES / OCR_IMAGE_DIR 을 클래스 속성으로 노출 (테스트/외부 참조용).
+    - 공통 응답 헬퍼 success_response / error_response 를 모듈 상단에 둠.
 
-[mock path — fallback]
-    - 키가 없거나 SDK 호출이 실패한 경우, 명세 더미 텍스트(DUMMY_OCR_TEXT) 와
-      고정 ocr_source_id "ocr_mock_001" 을 그대로 반환.
-    - 응답 스키마(ocr_source_id, extracted_text, confidence, document_id,
-      image_filename) 는 real/mock 동일하므로 라우터/프론트는 분기를 둘 필요 없다.
-    - 디버깅을 위해 응답에 _source 필드를 부여한다 ("openai"|"mock"|"mock_fallback").
-
-[유지된 Mock 영역]
-    get_result(), confirm_result() 는 OCR 결과 저장소(DB) 가 필요한 메서드인데,
-    DB 모델은 절대 수정 금지 영역이라 본 PR 에서는 Mock 으로 둔다.
-    실제 구현 시 본 메서드 본문만 교체하면 라우터는 영향 받지 않는다.
+[엔진 정책]
+    - 명세는 pytesseract 기반이지만, 본 PR 은 Vision API + mock 폴백을 유지.
+    - 따라서 명세상 OCR_ENGINE_NOT_FOUND 는 "Vision 도 안 되고 mock 폴백도 막힌"
+      극단적 케이스에 대한 표준 코드로만 정의해 둔다 (현재 흐름에선 발생 안 함).
 """
 
 from __future__ import annotations
@@ -28,12 +24,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import UploadFile
 
-# 기존 인프라 사용. core/* 는 본 PR 의 수정 허용 범위가 아니므로 import 만.
+# core/* 는 본 PR 의 수정 허용 범위가 아니므로 import 만 한다.
 # get_client(): OpenAI 클라이언트 싱글톤 또는 None.
 # OPENAI_MODEL_VISION: 사용할 vision 모델명.
 from app.core.openai_client import get_client
@@ -42,10 +41,75 @@ from app.core.config import OPENAI_MODEL_VISION
 logger = logging.getLogger(__name__)
 
 
-# -----------------------------------------------------------------------------
-# 더미 텍스트 / 콘텐츠 타입 화이트리스트 / Vision 시스템 프롬프트
-# -----------------------------------------------------------------------------
-# 명세 [기능 2] 에서 정의된 가정통신문 더미. mock 폴백에서 그대로 반환.
+# =============================================================================
+# 공통 응답 헬퍼 (명세 [공통 응답 헬퍼])
+# =============================================================================
+# 명세는 ocr_service.py "내부 또는 상단" 위치를 요구. 라우터/다른 서비스가
+# 동일 envelope 을 재사용할 수 있도록 모듈 최상단에 둔다.
+def success_response(data: dict[str, Any], message: str = "") -> dict[str, Any]:
+    """공통 성공 응답 envelope.
+
+    스키마:
+        {"success": True, "data": ..., "message": ..., "error": None}
+    """
+    return {"success": True, "data": data, "message": message, "error": None}
+
+
+def error_response(
+    error: str,
+    message: str = "",
+    data: Any = None,
+) -> dict[str, Any]:
+    """공통 실패 응답 envelope.
+
+    스키마:
+        {"success": False, "data": ..., "message": ..., "error": "<CODE>"}
+    """
+    return {"success": False, "data": data, "message": message, "error": error}
+
+
+# =============================================================================
+# 도메인 예외 — 라우터에서 HTTP 코드 + envelope 으로 매핑
+# =============================================================================
+class OcrServiceError(Exception):
+    """OCR 도메인 공통 베이스 예외."""
+
+    code: str = "OCR_SERVICE_ERROR"
+    http_status: int = 500
+
+
+class InvalidFileTypeError(OcrServiceError):
+    """이미지가 아닌 파일 또는 허용되지 않은 MIME 타입."""
+
+    code = "INVALID_FILE_TYPE"
+    http_status = 400
+
+
+class FileSaveFailedError(OcrServiceError):
+    """업로드 이미지를 디스크에 저장하지 못함 (권한/디스크 등)."""
+
+    code = "FILE_SAVE_FAILED"
+    http_status = 500
+
+
+class OcrEngineNotFoundError(OcrServiceError):
+    """OCR 엔진을 찾을 수 없음 (명세상 Tesseract 미설치 케이스)."""
+
+    code = "OCR_ENGINE_NOT_FOUND"
+    http_status = 500
+
+
+class OcrSourceNotFoundError(OcrServiceError):
+    """ocr_source_id 에 해당하는 레코드를 찾을 수 없음."""
+
+    code = "OCR_SOURCE_NOT_FOUND"
+    http_status = 404
+
+
+# =============================================================================
+# 상수
+# =============================================================================
+# 명세 [기능 2] 더미 텍스트. mock 폴백/get_result 에서 사용.
 DUMMY_OCR_TEXT = (
     "2026학년도 가정통신문\n"
     "\n"
@@ -63,7 +127,8 @@ DUMMY_OCR_TEXT = (
     "연락처: 010-1234-5678"
 )
 
-# 라우터에서 화이트리스트 검증에 쓰는 set. 명세상 4종만 허용.
+# 라우터 호환을 위해 모듈 레벨에서도 노출 (기존 import 경로 유지).
+# 실 진실은 OcrService.ALLOWED_TYPES (클래스 속성).
 ALLOWED_IMAGE_CONTENT_TYPES: set[str] = {
     "image/jpeg",
     "image/png",
@@ -71,15 +136,23 @@ ALLOWED_IMAGE_CONTENT_TYPES: set[str] = {
     "image/webp",
 }
 
-# Vision 모델용 시스템 프롬프트.
-# - "텍스트만" 추출하라고 명시.
-# - 추측/요약/번역 금지.
-# - 줄바꿈을 가능한 한 원본대로 유지.
+# content-type → 파일 확장자 매핑.
+_CONTENT_TYPE_TO_EXT: dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+# Vision 모델 시스템 프롬프트.
 _OCR_SYSTEM_PROMPT = (
     "너는 이미지 OCR 어시스턴트다. 사용자가 보낸 이미지에서 보이는 한국어/영문 "
     "텍스트만 그대로 추출해 평문으로 반환해라. 추측·요약·번역하지 말고, "
     "줄바꿈은 가능한 원본 레이아웃을 유지해라. 텍스트 외 설명·마크다운 금지."
 )
+
+# 파일명 sanitize 용. path traversal / 공백 / 특수문자 제거.
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 # =============================================================================
@@ -88,82 +161,230 @@ _OCR_SYSTEM_PROMPT = (
 class OcrService:
     """OCR 텍스트 추출/조회/확정 책임 서비스.
 
-    제공 메서드:
-        - extract_text(image_file)              : 이미지 → 텍스트 (real or mock).
-        - get_result(ocr_source_id)             : 결과 단건 조회 (Mock — DB TODO).
-        - confirm_result(ocr_source_id, edited) : 사용자 수정본 확정 (Mock — DB TODO).
+    명세 정렬 메서드:
+        - validate_image(file)              : MIME 검증 (실패 시 InvalidFileTypeError).
+        - save_image(file)                  : 디스크 저장 (실패 시 FileSaveFailedError).
+        - extract_text_from_image(path)     : Vision 호출 → 텍스트 추출 + confidence.
+        - generate_ocr_id()                 : "ocr_<uuid8>" 식별자 발급.
+        - get_result(ocr_source_id)         : in-memory store 조회 (없으면 404 raise).
+        - confirm_result(ocr_source_id, ed) : confirmed_text 갱신 (없으면 404 raise).
     """
 
-    # =========================================================================
-    # Public: extract_text — real Vision 우선, 실패 시 mock 폴백
-    # =========================================================================
-    async def extract_text(self, image_file: UploadFile) -> dict[str, Any]:
-        """이미지에서 텍스트를 추출한다.
+    # 명세 [OcrService 클래스] 클래스 속성.
+    ALLOWED_TYPES: list[str] = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+    ]
+    OCR_IMAGE_DIR: str = "uploads/ocr-images"
 
-        키가 있으면 OpenAI Vision 으로 실제 OCR 을 수행하고, 키가 없거나 호출이
-        실패하면 명세 더미 텍스트로 폴백한다. 응답 스키마는 두 경로가 동일.
+    # 인스턴스별 in-memory store. DB 연동 전 GET/confirm 동작을 시뮬레이션.
+    # main.py 에서 싱글톤으로 사용되므로 프로세스 생존 동안 유지된다.
+    def __init__(self) -> None:
+        self._store: dict[str, dict[str, Any]] = {}
+
+    # =========================================================================
+    # 1) validate_image — 명세 시그니처 그대로
+    # =========================================================================
+    def validate_image(self, file: UploadFile) -> None:
+        """업로드 파일의 content_type 이 ALLOWED_TYPES 에 있는지 검증.
+
+        Raises:
+            InvalidFileTypeError: 허용되지 않은 MIME 타입.
         """
-        # 업로드 파일 bytes 와 content_type, filename 을 한 번에 확보.
-        # (real/mock 양쪽에서 공통으로 필요)
-        image_bytes = await image_file.read()
-        content_type = image_file.content_type
-        filename = image_file.filename
+        if file.content_type not in self.ALLOWED_TYPES:
+            raise InvalidFileTypeError(
+                f"지원하지 않는 이미지 형식입니다: {file.content_type!r}"
+            )
 
-        # 1) Real path 시도 — 클라이언트가 None 이 아니면 키가 살아 있는 상태.
+    # =========================================================================
+    # 2) save_image — 명세 시그니처 그대로 (uploads/ocr-images/<ts>_<원본명>)
+    # =========================================================================
+    async def save_image(self, file: UploadFile) -> str:
+        """업로드 이미지를 디스크에 저장하고 저장 경로를 반환한다.
+
+        파일명 정책:
+            - 명세: "uploads/ocr-images/<timestamp>_<원본파일명>".
+            - 보안상 원본 파일명은 sanitize 한다 (path traversal 차단).
+            - sanitize 결과가 비면 uuid 단편 + content-type 기반 확장자로 대체.
+
+        Raises:
+            FileSaveFailedError: 디스크 쓰기 실패.
+
+        Returns:
+            저장된 파일의 경로 문자열 (POSIX 슬래시).
+            예) "uploads/ocr-images/20260509_153012_invoice.jpg"
+        """
+        # 디렉토리 보장 (명세: os.makedirs(exist_ok=True)).
+        target_dir = Path(self.OCR_IMAGE_DIR)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise FileSaveFailedError(f"업로드 디렉토리 생성 실패: {exc}") from exc
+
+        # 원본 파일명 sanitize.
+        safe_name = self._sanitize_filename(file.filename, file.content_type)
+
+        # timestamp prefix.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved_filename = f"{timestamp}_{safe_name}"
+        target_path = target_dir / saved_filename
+
+        # 파일 본문 읽기 (UploadFile.read 는 비동기).
+        try:
+            content = await file.read()
+        except Exception as exc:  # noqa: BLE001
+            raise FileSaveFailedError(f"업로드 본문 읽기 실패: {exc}") from exc
+
+        # 디스크 쓰기는 별도 스레드에서 (이벤트 루프 보호).
+        try:
+            await asyncio.to_thread(target_path.write_bytes, content)
+        except OSError as exc:
+            raise FileSaveFailedError(f"파일 저장 실패: {exc}") from exc
+
+        # 명세 응답 키 image_path 에 들어갈 값 (POSIX 슬래시).
+        return target_path.as_posix()
+
+    # =========================================================================
+    # 3) extract_text_from_image — 명세 시그니처. 실제 Vision 호출 + mock 폴백.
+    # =========================================================================
+    def extract_text_from_image(self, image_path: str) -> dict[str, Any]:
+        """저장된 이미지에서 텍스트를 추출.
+
+        명세상 반환 dict:
+            {"text": "<extracted>", "confidence": <0~1 float>}
+            엔진 미설치 시:
+            {"text": "", "confidence": 0.0, "error": "tesseract_not_found"}
+
+        본 구현은 Vision 을 사용하되, 키/SDK 부재 또는 호출 실패 시
+        명세 더미 텍스트로 폴백한다 (사용자 옵션 2번 정책).
+        """
+        # 클라이언트 부재 = 명세상 엔진 미설치와 의미가 가장 가깝다.
+        # 다만 정책상 mock 폴백을 유지하므로 에러로 raise 하지 않고 더미 반환.
         client = get_client()
-        if client is not None:
-            try:
-                # 동기 SDK 를 별도 스레드로 보내 이벤트 루프 보호.
-                text, model_used = await asyncio.to_thread(
-                    self._call_openai_vision, image_bytes, content_type
-                )
-                # OpenAI 가 빈 텍스트를 돌려준 케이스도 가끔 있음 → 더미로 보정.
-                stripped = (text or "").strip()
-                return {
-                    "ocr_source_id": f"ocr_{uuid.uuid4().hex[:12]}",
-                    "extracted_text": stripped or DUMMY_OCR_TEXT,
-                    # OpenAI 는 글자별 score 를 주지 않으므로 1.0 으로 표기.
-                    # (추후 ensemble/heuristic 으로 추정값 도입 가능)
-                    "confidence": 1.0,
-                    "document_id": None,  # documents 도메인 미연동
-                    "image_filename": filename,
-                    "_source": "openai",
-                    "_model": model_used,
-                }
-            except Exception as exc:  # noqa: BLE001 — 폴백 대상
-                # API 호출이 망가진 경우(키 만료, 쿼터 초과, 네트워크 등) 로그 + mock.
-                logger.warning("OpenAI Vision OCR 실패 → mock 폴백: %s", exc)
-                return self._mock_response(filename, error=str(exc))
+        if client is None:
+            logger.info("OpenAI client 부재 → mock 텍스트 폴백")
+            return {
+                "text": DUMMY_OCR_TEXT,
+                "confidence": 0.91,
+                "_source": "mock",
+            }
 
-        # 2) Mock path — 키 없음 또는 SDK 미설치.
-        return self._mock_response(filename)
+        # 디스크에서 bytes 로드.
+        try:
+            image_bytes = Path(image_path).read_bytes()
+        except OSError as exc:
+            # 저장은 성공했는데 곧장 못 읽는 비정상 상태 → 폴백.
+            logger.warning("저장 이미지 재로딩 실패 → mock 폴백: %s", exc)
+            return {
+                "text": DUMMY_OCR_TEXT,
+                "confidence": 0.91,
+                "_source": "mock_fallback",
+                "_error": str(exc),
+            }
+
+        # content-type 은 확장자로 역추정 (없으면 image/png 기본).
+        ext = Path(image_path).suffix.lower()
+        content_type = next(
+            (ct for ct, e in _CONTENT_TYPE_TO_EXT.items() if e == ext),
+            "image/png",
+        )
+
+        # Vision 호출.
+        try:
+            text, model_used = self._call_openai_vision(image_bytes, content_type)
+            stripped = (text or "").strip()
+            return {
+                "text": stripped or DUMMY_OCR_TEXT,
+                # OpenAI 는 글자별 score 를 주지 않으므로 1.0 으로 표기.
+                "confidence": 1.0 if stripped else 0.91,
+                "_source": "openai" if stripped else "mock_fallback",
+                "_model": model_used,
+            }
+        except Exception as exc:  # noqa: BLE001 — 폴백 대상
+            logger.warning("OpenAI Vision OCR 실패 → mock 폴백: %s", exc)
+            return {
+                "text": DUMMY_OCR_TEXT,
+                "confidence": 0.91,
+                "_source": "mock_fallback",
+                "_error": str(exc),
+            }
 
     # =========================================================================
-    # Public: get_result / confirm_result (DB 연동 전이라 Mock 유지)
+    # 4) generate_ocr_id — 명세 ("ocr_" + uuid4 앞 8자리)
     # =========================================================================
-    def get_result(self, ocr_source_id: str) -> dict[str, Any]:
-        """OCR 결과를 ocr_source_id 로 단건 조회 (Mock).
+    def generate_ocr_id(self) -> str:
+        return f"ocr_{uuid.uuid4().hex[:8]}"
+
+    # =========================================================================
+    # 보조: extract 결과를 in-memory store 에 등록 (GET/confirm 동작용)
+    # =========================================================================
+    def remember(
+        self,
+        ocr_source_id: str,
+        extracted_text: str,
+        image_path: str | None,
+    ) -> None:
+        """라우터가 extract 종료 시 호출. 이후 GET/confirm 에서 조회 가능.
 
         TODO(실제 DB 연동):
-            - DB 또는 캐시에서 ocr_source_id 로 raw_text/cleaned_text/image_path 조회.
-            - 없으면 도메인 에러 → 라우터에서 404 처리.
-            - documents 도메인이 절대 수정 금지라 본 PR 에서는 Mock 으로만 둔다.
+            ocr_sources 테이블에 raw_text/image_path INSERT.
         """
-        return {
+        self._store[ocr_source_id] = {
             "ocr_source_id": ocr_source_id,
-            "raw_text": DUMMY_OCR_TEXT,
-            "cleaned_text": DUMMY_OCR_TEXT,
-            "image_path": "/uploads/ocr-images/mock_image.jpg",
+            "raw_text": extracted_text,
+            "cleaned_text": extracted_text,
+            "image_path": image_path,
+            "status": "extracted",
         }
 
-    def confirm_result(self, ocr_source_id: str, edited_text: str) -> dict[str, Any]:
-        """사용자 수정본을 확정 상태로 저장 (Mock).
+    # =========================================================================
+    # GET /api/ocr/{ocr_source_id}
+    # =========================================================================
+    def get_result(self, ocr_source_id: str) -> dict[str, Any]:
+        """OCR 결과를 단건 조회.
 
         TODO(실제 DB 연동):
-            - OCR 레코드(ocr_source_id) 의 confirmed_text=edited_text,
-              status='confirmed' 로 UPDATE.
-            - 레코드 없으면 도메인 에러 → 라우터에서 404 처리.
+            ocr_sources 에서 ocr_source_id 로 SELECT.
+
+        Raises:
+            OcrSourceNotFoundError: 미등록 ID.
         """
+        record = self._store.get(ocr_source_id)
+        if record is None:
+            raise OcrSourceNotFoundError(
+                f"존재하지 않는 ocr_source_id: {ocr_source_id}"
+            )
+        # 명세 응답 키 4종만 노출 (status 등은 제외).
+        return {
+            "ocr_source_id": record["ocr_source_id"],
+            "raw_text": record["raw_text"],
+            "cleaned_text": record["cleaned_text"],
+            "image_path": record["image_path"],
+        }
+
+    # =========================================================================
+    # POST /api/ocr/{ocr_source_id}/confirm
+    # =========================================================================
+    def confirm_result(
+        self, ocr_source_id: str, edited_text: str
+    ) -> dict[str, Any]:
+        """사용자 수정본을 확정 상태로 저장.
+
+        TODO(실제 DB 연동):
+            ocr_sources.cleaned_text=edited_text, status='confirmed' UPDATE.
+
+        Raises:
+            OcrSourceNotFoundError: 미등록 ID.
+        """
+        record = self._store.get(ocr_source_id)
+        if record is None:
+            raise OcrSourceNotFoundError(
+                f"존재하지 않는 ocr_source_id: {ocr_source_id}"
+            )
+        record["cleaned_text"] = edited_text
+        record["status"] = "confirmed"
         return {
             "ocr_source_id": ocr_source_id,
             "confirmed_text": edited_text,
@@ -171,58 +392,54 @@ class OcrService:
         }
 
     # =========================================================================
-    # Internal helpers
+    # 내부 헬퍼들
     # =========================================================================
-    def _mock_response(
-        self,
-        filename: str | None,
-        error: str | None = None,
-    ) -> dict[str, Any]:
-        """mock 응답 빌더 — 키 없음/호출 실패 양쪽에서 재사용."""
-        result: dict[str, Any] = {
-            "ocr_source_id": "ocr_mock_001",
-            "extracted_text": DUMMY_OCR_TEXT,
-            "confidence": 0.91,
-            "document_id": None,
-            "image_filename": filename,
-            "_source": "mock_fallback" if error else "mock",
-        }
-        if error:
-            # 디버깅용 — 실제 운영에서는 sanitize 가 필요할 수 있음.
-            result["_error"] = error
-        return result
+    @classmethod
+    def _sanitize_filename(
+        cls,
+        original_filename: str | None,
+        content_type: str | None,
+    ) -> str:
+        """원본 파일명을 안전하게 정제.
+
+        - path traversal 방지를 위해 디렉토리 구분자 제거.
+        - 영숫자/._- 만 허용. 그 외는 _ 로 치환.
+        - 비어버리면 uuid + content-type 기반 확장자로 대체.
+        """
+        if original_filename:
+            # 디렉토리 부분 제거 (Windows / POSIX 양쪽).
+            base = original_filename.replace("\\", "/").rsplit("/", 1)[-1]
+            sanitized = _UNSAFE_FILENAME_CHARS.sub("_", base).strip("._-")
+            if sanitized:
+                return sanitized
+
+        # fallback — uuid + 확장자.
+        ext = _CONTENT_TYPE_TO_EXT.get(content_type or "", ".bin")
+        return f"upload_{uuid.uuid4().hex[:8]}{ext}"
 
     @staticmethod
-    def _image_bytes_to_data_url(image_bytes: bytes, content_type: str | None) -> str:
-        """이미지 bytes 를 OpenAI Vision API 의 image_url 입력(data URL) 으로 변환.
-
-        OpenAI 는 외부 URL 또는 data:base64 형태를 받는다. 별도 업로드 없이
-        bytes 를 직접 인라인 전달.
-        """
+    def _image_bytes_to_data_url(
+        image_bytes: bytes, content_type: str | None
+    ) -> str:
+        """이미지 bytes 를 OpenAI Vision 의 image_url(data URL) 입력으로 변환."""
         mime = content_type or "image/png"
         b64 = base64.b64encode(image_bytes).decode("ascii")
         return f"data:{mime};base64,{b64}"
 
     def _call_openai_vision(
-        self,
-        image_bytes: bytes,
-        content_type: str | None,
+        self, image_bytes: bytes, content_type: str | None
     ) -> tuple[str, str]:
         """OpenAI Vision 으로 이미지 → 텍스트.
-
-        [동기 메서드]
-            openai SDK v1 의 동기 클라이언트 사용. extract_text() 가
-            asyncio.to_thread 로 감싸서 호출하므로 이벤트 루프는 막히지 않는다.
 
         Returns:
             (extracted_text, model_used) 튜플.
         """
         client = get_client()
         if client is None:
-            raise RuntimeError("OpenAI client is not configured")
+            # extract_text_from_image 에서 이미 가드되어 있음 — 방어적 raise.
+            raise OcrEngineNotFoundError("OpenAI client is not configured")
 
         data_url = self._image_bytes_to_data_url(image_bytes, content_type)
-
         completion = client.chat.completions.create(
             model=OPENAI_MODEL_VISION,
             messages=[
@@ -235,7 +452,6 @@ class OcrService:
                     ],
                 },
             ],
-            # OCR 은 결정론적이어야 하므로 temperature 0.
             temperature=0,
         )
         text = completion.choices[0].message.content or ""

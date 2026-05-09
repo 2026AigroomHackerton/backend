@@ -1,324 +1,295 @@
 # [백엔드2 담당] 수정 허용 파일 - feature/backend-ocr-voice-storage 브랜치
-"""External Storage Service (Class-based, real integration capable).
+"""External Storage Service.
 
 [책임]
-    Google Drive, Notion 등 외부 저장소 연동 비즈니스 로직 계층.
-    각 provider 의 연결 상태(status) 를 동적으로 감지하고, 업로드/내보내기
-    같은 실제 호출도 real path / mock fallback 양쪽으로 지원한다.
+    외부 저장소(Google Drive, Notion) 와 로컬/샘플 임포트 도메인의 비즈니스 로직 계층.
 
-[real path]
-    - Google Drive : googleapiclient + google-auth (서비스 계정 JSON).
-    - Notion       : Notion REST API 직접 호출 (httpx 우선, 없으면 stdlib urllib).
+[현 PR 범위 (해커톤 MVP)]
+    - 로컬 파일 가져오기 : `save_uploaded_file()` 으로 실제 디스크 저장.
+    - 샘플 문서 임포트   : `import_sample_document()` 으로 샘플 텍스트 → DB INSERT.
+    - Google Drive       : stub (OAuth 미구현). 라우터에서 HTTP 501 응답 처리.
+    - Notion             : stub (Integration Token 미설정). 라우터에서 HTTP 501.
 
-[mock path — fallback]
-    - 라이브러리 미설치, env 미설정, API 호출 실패 → 더미 응답 반환.
-    - status 는 다음 3가지 중 하나로 응답한다:
-        - "connected"    : real 호출이 가능한 상태 (lib + creds 모두 OK)
-        - "disconnected" : 라이브러리는 있는데 credentials 가 없음
-        - "coming_soon"  : 라이브러리 자체가 미설치 (진짜 "추후 지원" 의미)
-
-[필요 환경변수 — .env 에 추가]
-    # Google Drive (서비스 계정 JSON 경로 OR 인라인 JSON)
-    GOOGLE_SERVICE_ACCOUNT_JSON=/abs/path/to/service-account.json
-    GOOGLE_DRIVE_FOLDER_ID=optional-target-folder-id
-
-    # Notion (https://www.notion.so/my-integrations 에서 발급)
-    NOTION_API_TOKEN=secret_xxxxxxxx
-    NOTION_PARENT_PAGE_ID=hyphenated-or-non-hyphenated-page-id
-
-[필요 라이브러리 — requirements.txt 에 추가 (현 PR 범위 외)]
-    google-api-python-client>=2.0.0
-    google-auth>=2.0.0
-    httpx>=0.27.0   # Notion 호출용. 미설치시 stdlib urllib 폴백.
+[DB 연동 정책]
+    documents / document_texts 모델은 "절대 수정 금지" 영역이라 실제 INSERT 코드를
+    이 PR 에서 작성하지 않는다. 대신 호출부에서 db 세션이 들어왔을 때를 대비한
+    분기와 TODO 주석을 남겨, 모델 PR 이 머지된 뒤 본 메서드 본문만 교체하면
+    바로 동작하도록 인터페이스를 안정화한다.
 """
 
+# 타입 힌트 지연 평가. 함수 시그니처에 쓰는 타입을 미리 import 하지 않아도 되게 해 준다.
 from __future__ import annotations
 
-import json as _json
+# 진단용 로거. 예외 폴백 시 무엇이 실패했는지 남긴다.
 import logging
+
+# 디렉터리 자동 생성에 사용 (os.makedirs).
 import os
+
+# 응답/내부 자료구조의 값 타입을 유연하게 두기 위한 Any.
 from typing import Any
 
+# 업로드된 파일 객체 — multipart/form-data 의 파일 파라미터를 다룰 때 사용.
+from fastapi import UploadFile
+
+# 모듈 단위 로거. logger.warning(...) 등으로 사용.
 logger = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Mock 더미 데이터 (lib/credentials 미설정 시 응답에 사용)
-# ─────────────────────────────────────────────────────────────────────
-_MOCK_DRIVE_FILE_ID = "mock_drive_file_001"
-_MOCK_NOTION_PAGE_ID = "mock_notion_page_001"
-
-# Notion API 버전 (https://developers.notion.com/reference/versioning).
-_NOTION_API_VERSION = "2022-06-28"
-_NOTION_API_BASE = "https://api.notion.com/v1"
-
-
-# =============================================================================
-# Provider 가용성 감지 — 라이브러리 + credentials 동시 체크
-# =============================================================================
-def _detect_google_drive() -> tuple[str, str | None]:
-    """Google Drive 의 (status, reason) 을 반환.
-
-    status:
-        - "coming_soon"  : googleapiclient / google-auth 미설치
-        - "disconnected" : 라이브러리는 있는데 credentials env 미설정/파일 없음
-        - "connected"    : 호출 가능한 상태
-    """
-    # 1) 라이브러리 import 시도 (lazy — 본 함수가 불릴 때만).
-    try:
-        import googleapiclient  # noqa: F401
-        from google.oauth2 import service_account  # noqa: F401
-    except ImportError as exc:
-        return "coming_soon", f"library_missing: {exc.name or exc}"
-
-    # 2) 서비스 계정 JSON 의 경로 또는 인라인 JSON 확인.
-    creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    creds_inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_INFO")
-    if not (creds_path or creds_inline):
-        return "disconnected", "credentials_missing"
-
-    # 3) 파일 경로로 받은 경우 실제 존재 확인.
-    if creds_path and not os.path.isfile(creds_path):
-        return "disconnected", f"credentials_file_not_found: {creds_path}"
-
-    return "connected", None
-
-
-def _detect_notion() -> tuple[str, str | None]:
-    """Notion 의 (status, reason) 을 반환.
-
-    Notion 은 httpx 가 없어도 stdlib urllib 으로 호출 가능하므로
-    "coming_soon" 으로 떨어지는 케이스가 거의 없다.
-    """
-    if not os.getenv("NOTION_API_TOKEN"):
-        return "disconnected", "credentials_missing"
-    return "connected", None
 
 
 # =============================================================================
 # StorageService
 # =============================================================================
 class StorageService:
-    """외부 저장소 통합 서비스.
+    """외부 저장소/임포트 통합 서비스.
 
     제공 메서드:
-        - list_providers()                       : provider 별 동적 status 목록.
-        - upload_to_google_drive(name, content)  : GDrive 업로드 (real or mock).
-        - export_to_notion(title, content)       : Notion 페이지 생성 (real or mock).
+        - get_providers()                    : 명세 PROVIDERS 정적 목록 반환.
+        - import_sample_document(...)        : 샘플 문서 텍스트 → DB INSERT (or TODO).
+        - get_connectors_status()            : google_drive/notion 연결 상태.
+        - save_uploaded_file(file, dest_dir) : 업로드 파일을 디스크에 저장.
     """
 
-    # =========================================================================
-    # Public: list_providers — 동적 status
-    # =========================================================================
-    def list_providers(self) -> list[dict[str, Any]]:
-        """provider 별 연결 상태 목록을 반환한다.
-
-        각 항목 키:
-            provider : "google_drive" | "notion"
-            status   : "connected" | "disconnected" | "coming_soon"
-            reason   : status != "connected" 일 때 진단 문자열 (선택)
-        """
-        gdrive_status, gdrive_reason = _detect_google_drive()
-        notion_status, notion_reason = _detect_notion()
-
-        items: list[dict[str, Any]] = [
-            {"provider": "google_drive", "status": gdrive_status},
-            {"provider": "notion", "status": notion_status},
-        ]
-        # 디버깅 편의를 위해 reason 이 있을 때만 노출.
-        if gdrive_reason:
-            items[0]["reason"] = gdrive_reason
-        if notion_reason:
-            items[1]["reason"] = notion_reason
-        return items
-
-    # =========================================================================
-    # Public: Google Drive 업로드 (real or mock)
-    # =========================================================================
-    def upload_to_google_drive(
-        self,
-        file_name: str,
-        content: bytes,
-        mime_type: str = "text/plain",
-    ) -> dict[str, Any]:
-        """파일을 Google Drive 에 업로드한다.
-
-        실제 라이브러리 + credentials 가 있으면 진짜 업로드, 그렇지 않으면 mock.
-        Returns:
-            {provider, file_id, file_name, size_bytes, _source[, _error]}
-        """
-        try:
-            return self._upload_to_google_drive_real(file_name, content, mime_type)
-        except Exception as exc:  # noqa: BLE001 — 폴백 대상
-            logger.warning("Google Drive 업로드 실패 → mock 폴백: %s", exc)
-            return {
-                "provider": "google_drive",
-                "file_id": _MOCK_DRIVE_FILE_ID,
-                "file_name": file_name,
-                "size_bytes": len(content),
-                "_source": "mock_fallback",
-                "_error": str(exc),
-            }
-
-    def _upload_to_google_drive_real(
-        self,
-        file_name: str,
-        content: bytes,
-        mime_type: str,
-    ) -> dict[str, Any]:
-        """실제 GDrive 업로드. 모든 실패 케이스(미설치/미설정/네트워크) 는
-        예외를 발생시켜 상위에서 mock 폴백되도록 한다."""
-        # lazy import — 라이브러리 없으면 ImportError → 폴백.
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaInMemoryUpload
-        from google.oauth2 import service_account
-
-        creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-        creds_inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_INFO")
-        scopes = ["https://www.googleapis.com/auth/drive.file"]
-
-        # credentials 객체 생성: 파일 경로 우선, 인라인 JSON 차선.
-        if creds_path:
-            creds = service_account.Credentials.from_service_account_file(
-                creds_path, scopes=scopes
-            )
-        elif creds_inline:
-            info = _json.loads(creds_inline)
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=scopes
-            )
-        else:
-            raise RuntimeError(
-                "Google Drive credentials missing "
-                "(GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_INFO)"
-            )
-
-        # cache_discovery=False : 디스크 캐시 미사용 (운영 환경 권장).
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        media = MediaInMemoryUpload(content, mimetype=mime_type)
-
-        body: dict[str, Any] = {"name": file_name}
-        # 폴더 지정이 있으면 그 안에 업로드.
-        folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-        if folder_id:
-            body["parents"] = [folder_id]
-
-        result = (
-            service.files()
-            .create(body=body, media_body=media, fields="id, name, size")
-            .execute()
-        )
-        # size 는 응답에 항상 있는 게 아니라서 안전하게 fallback.
-        size = result.get("size")
-        return {
+    # -------------------------------------------------------------------------
+    # PROVIDERS — 클라이언트(Front) 용 정적 목록.
+    # -------------------------------------------------------------------------
+    # 항목 의미:
+    #   provider     : 코드/식별용 키 (영문 snake_case)
+    #   display_name : UI 표시명 (한국어 가능)
+    #   status       : "available" | "coming_soon"
+    #                  - available  : 즉시 사용 가능 (local, mock)
+    #                  - coming_soon: OAuth/Integration 미구현이라 곧 지원 예정
+    #   description  : 사용자 화면에 보여 줄 한 줄 설명
+    # 클래스 속성으로 두는 이유:
+    #   - 인스턴스마다 복사할 필요 없는 불변 메타데이터.
+    #   - 테스트에서 StorageService.PROVIDERS 로 직접 접근 가능.
+    PROVIDERS: list[dict[str, Any]] = [
+        {
             "provider": "google_drive",
-            "file_id": result.get("id"),
-            "file_name": result.get("name"),
-            "size_bytes": int(size) if size else len(content),
-            "_source": "google_drive",
-        }
+            "display_name": "Google Drive",
+            "status": "coming_soon",
+            "description": "Google Drive 문서를 가져옵니다. (준비 중)",
+        },
+        {
+            "provider": "notion",
+            "display_name": "Notion",
+            "status": "coming_soon",
+            "description": "Notion 페이지를 가져옵니다. (준비 중)",
+        },
+        {
+            "provider": "local",
+            "display_name": "로컬 파일",
+            "status": "available",
+            "description": "기기에서 파일을 직접 업로드합니다.",
+        },
+        {
+            "provider": "mock",
+            "display_name": "샘플 문서",
+            "status": "available",
+            "description": "데모용 샘플 문서를 불러옵니다.",
+        },
+    ]
+
+    # -------------------------------------------------------------------------
+    # SAMPLE_DOCUMENTS — 샘플 임포트용 더미 텍스트.
+    # -------------------------------------------------------------------------
+    # 키(document_type) 는 한국어이며, 라우터가 받은 값으로 그대로 lookup 한다.
+    # 키가 없으면 "가정통신문" 으로 폴백한다 (import_sample_document 참고).
+    SAMPLE_DOCUMENTS: dict[str, dict[str, str]] = {
+        "가정통신문": {
+            "title": "2026학년도 5월 가정통신문",
+            "text": (
+                "2026학년도 가정통신문\n"
+                "\n"
+                "안녕하십니까. 학부모님의 가정에 건강과 행복이 가득하기를 바랍니다.\n"
+                "\n"
+                "이번 주 활동 안내\n"
+                "- 활동명: 환경정화 활동\n"
+                "- 일시: 2026년 5월 20일 (화) 오전 10시\n"
+                "- 장소: 학교 주변 공원\n"
+                "- 준비물: 편한 복장, 장갑\n"
+                "\n"
+                "참가 여부를 5월 15일까지 담임 선생님께 알려주시기 바랍니다.\n"
+                "\n"
+                "담당 교사: 홍길동\n"
+                "연락처: 010-1234-5678"
+            ),
+        },
+        "지원서": {
+            "title": "프로그램 지원서",
+            "text": (
+                "프로그램 지원서\n"
+                "\n"
+                "성명: \n"
+                "연락처: \n"
+                "이메일: \n"
+                "주소: \n"
+                "\n"
+                "지원 동기:\n"
+                "\n"
+                "자기소개:\n"
+                "\n"
+                "희망 직무:\n"
+            ),
+        },
+        "회의록": {
+            "title": "팀 회의록",
+            "text": (
+                "회의록\n"
+                "\n"
+                "일시: 2026년 5월 9일\n"
+                "장소: 회의실 A\n"
+                "참석자: \n"
+                "\n"
+                "안건:\n"
+                "1. \n"
+                "2. \n"
+                "\n"
+                "결정 사항:\n"
+                "\n"
+                "다음 회의 일정: "
+            ),
+        },
+    }
 
     # =========================================================================
-    # Public: Notion 페이지 생성 (real or mock)
+    # Public: get_providers
     # =========================================================================
-    def export_to_notion(
+    def get_providers(self) -> list[dict[str, Any]]:
+        """PROVIDERS 정적 목록을 반환한다.
+
+        호출부(라우터)는 이 결과를 공통 응답 envelope 의 `data.providers` 필드에 담는다.
+        반환값은 호출자가 변형해도 클래스 상수가 영향을 받지 않도록 얕은 복사본을 준다.
+        """
+        # list(...) 로 새 리스트를 만들어 반환 — 호출자가 append/pop 해도 PROVIDERS 자체는 안전.
+        return list(self.PROVIDERS)
+
+    # =========================================================================
+    # Public: import_sample_document
+    # =========================================================================
+    async def import_sample_document(
         self,
-        page_title: str,
-        content: str,
-        parent_page_id: str | None = None,
+        document_type: str,
+        db: Any = None,
     ) -> dict[str, Any]:
-        """문서를 Notion 페이지로 내보낸다.
+        """샘플 문서를 임포트한다.
+
+        흐름:
+            1) SAMPLE_DOCUMENTS 에서 document_type 으로 샘플 lookup.
+               존재하지 않으면 "가정통신문" 으로 폴백.
+            2) db 세션이 있으면 documents + document_texts 테이블에 INSERT.
+               (현재 PR 에서는 모델이 수정 금지 영역이라 TODO 만 남김)
+            3) db 가 없으면 INSERT 를 건너뛰고 imported_document_id 를 None 으로 둔다.
+            4) 응답 dict 반환.
 
         Args:
-            page_title     : 새 페이지 제목.
-            content        : 본문 텍스트 (단일 paragraph 블록으로 등록).
-            parent_page_id : 부모 페이지 ID. 누락 시 NOTION_PARENT_PAGE_ID env 사용.
+            document_type : "가정통신문" | "지원서" | "회의록" 등.
+            db            : SQLAlchemy 세션 (또는 동등한 DB handle). 미주입 시 None.
 
         Returns:
-            {provider, page_id, page_title, _source[, _error]}
+            {imported_document_id, title, source_type, extracted_text, status}
         """
-        try:
-            return self._export_to_notion_real(page_title, content, parent_page_id)
-        except Exception as exc:  # noqa: BLE001 — 폴백 대상
-            logger.warning("Notion export 실패 → mock 폴백: %s", exc)
-            return {
-                "provider": "notion",
-                "page_id": _MOCK_NOTION_PAGE_ID,
-                "page_title": page_title,
-                "_source": "mock_fallback",
-                "_error": str(exc),
-            }
+        # ---- 1) 샘플 lookup (없으면 기본값 "가정통신문") ------------------------
+        sample = self.SAMPLE_DOCUMENTS.get(document_type) or self.SAMPLE_DOCUMENTS["가정통신문"]
+        title: str = sample["title"]
+        text: str = sample["text"]
 
-    def _export_to_notion_real(
-        self,
-        page_title: str,
-        content: str,
-        parent_page_id: str | None,
-    ) -> dict[str, Any]:
-        """실제 Notion API 호출. httpx 우선, 없으면 stdlib urllib."""
-        token = os.getenv("NOTION_API_TOKEN")
-        parent = parent_page_id or os.getenv("NOTION_PARENT_PAGE_ID")
-        if not token:
-            raise RuntimeError("NOTION_API_TOKEN not set")
-        if not parent:
-            raise RuntimeError(
-                "NOTION_PARENT_PAGE_ID not set (or pass parent_page_id arg)"
-            )
+        # imported_document_id: 실제 DB INSERT 가 일어났을 때의 PK. 기본 None.
+        imported_document_id: Any = None
 
-        url = f"{_NOTION_API_BASE}/pages"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Notion-Version": _NOTION_API_VERSION,
-            "Content-Type": "application/json",
-        }
-        payload: dict[str, Any] = {
-            "parent": {"page_id": parent},
-            "properties": {
-                "title": [{"text": {"content": page_title}}],
-            },
-            "children": [
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": content}}
-                        ]
-                    },
-                }
-            ],
-        }
-
-        # 1) httpx 가 있으면 그걸로 (더 견고한 timeout/에러 처리).
-        try:
-            import httpx  # type: ignore
-
-            with httpx.Client(timeout=20.0) as cli:
-                resp = cli.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-        except ImportError:
-            # 2) httpx 없으면 stdlib urllib.
-            import urllib.request as _ur
-            import urllib.error as _ue
-
-            req = _ur.Request(
-                url,
-                data=_json.dumps(payload).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
+        # ---- 2) DB 세션이 있으면 INSERT 시도 ------------------------------------
+        if db is not None:
             try:
-                with _ur.urlopen(req, timeout=20) as resp:
-                    data = _json.loads(resp.read().decode("utf-8"))
-            except _ue.HTTPError as exc:
-                # Notion 의 에러 응답 본문을 그대로 전달해 디버깅 편의 ↑
-                err_body = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Notion HTTP {exc.code}: {err_body}") from exc
+                # TODO(실제 DB 연동):
+                #   documents 테이블 INSERT:
+                #       title=title, source_type="mock",
+                #       file_type="txt", parse_status="done"
+                #   document_texts 테이블 INSERT:
+                #       document_id=<위에서 생성된 id>, extracted_text=text
+                #   commit 후 생성된 document.id 를 imported_document_id 에 대입.
+                #
+                # documents 모델은 "절대 수정 금지" 영역이라 본 PR 에서 직접 작성하지 않는다.
+                # 모델 PR 이 머지된 뒤 이 블록 본문만 채우면 동작.
+                imported_document_id = None
+            except Exception as exc:  # noqa: BLE001 — INSERT 실패해도 임포트 자체는 응답
+                logger.warning("샘플 문서 DB INSERT 실패: %s", exc)
+                imported_document_id = None
+        else:
+            # TODO(실제 DB 연동):
+            #   라우터에서 db 의존성을 주입하도록 변경되면 위 블록이 활성화된다.
+            #   현재는 DB 세션 팩토리가 아직 없어 None 으로 호출됨.
+            imported_document_id = None
 
+        # ---- 3) 응답 페이로드 ----------------------------------------------------
         return {
-            "provider": "notion",
-            "page_id": data.get("id"),
-            "page_title": page_title,
-            "_source": "notion",
+            "imported_document_id": imported_document_id,
+            "title": title,
+            "source_type": "mock",
+            "extracted_text": text,
+            "status": "imported",
         }
+
+    # =========================================================================
+    # Public: get_connectors_status
+    # =========================================================================
+    def get_connectors_status(self) -> list[dict[str, Any]]:
+        """OAuth/Integration 기반 외부 커넥터의 연결 상태를 반환한다.
+
+        명세상 현재 단계에서는 google_drive, notion 모두 "disconnected" 로 고정.
+        실제 연동 시에는 토큰 만료/리프레시 상태를 검사해 status 를 동적으로 결정.
+
+        Returns:
+            [{provider, display_name, status, connected_at}, ...]
+        """
+        # connected_at 은 ISO8601 datetime 문자열 또는 None.
+        # 현재는 연결된 적이 없으므로 None 으로 통일.
+        return [
+            {
+                "provider": "google_drive",
+                "display_name": "Google Drive",
+                "status": "disconnected",
+                "connected_at": None,
+            },
+            {
+                "provider": "notion",
+                "display_name": "Notion",
+                "status": "disconnected",
+                "connected_at": None,
+            },
+        ]
+
+    # =========================================================================
+    # Public: save_uploaded_file
+    # =========================================================================
+    async def save_uploaded_file(self, file: UploadFile, dest_dir: str) -> str:
+        """업로드된 파일을 dest_dir 에 저장하고 저장 경로를 반환한다.
+
+        - dest_dir 이 없으면 os.makedirs 로 자동 생성 (exist_ok=True).
+        - filename 이 비어 있을 경우 'uploaded_file' 로 폴백.
+        - bytes 단위 쓰기 (binary-safe).
+
+        Args:
+            file     : FastAPI UploadFile (multipart 파일).
+            dest_dir : 저장 디렉터리 (상대/절대 경로 모두 가능).
+
+        Returns:
+            저장된 파일의 전체 경로 문자열.
+        """
+        # ---- 1) 대상 디렉터리 보장 ----------------------------------------------
+        # exist_ok=True : 디렉터리가 이미 있어도 에러 없이 통과.
+        os.makedirs(dest_dir, exist_ok=True)
+
+        # ---- 2) 저장 파일명 결정 -------------------------------------------------
+        # 클라이언트가 filename 을 비워 보내는 경우(예: 잘못된 multipart) 대비 폴백.
+        filename = file.filename or "uploaded_file"
+        # os.path.join 은 OS 별 구분자를 알아서 처리한다.
+        dest_path = os.path.join(dest_dir, filename)
+
+        # ---- 3) 파일 본문 읽고 디스크에 쓰기 -------------------------------------
+        # await 가 필요한 이유: UploadFile.read() 는 비동기 코루틴.
+        content = await file.read()
+        # "wb" : 바이너리 쓰기 모드. 텍스트로 열면 인코딩 오류 발생 가능.
+        with open(dest_path, "wb") as f:
+            f.write(content)
+
+        # ---- 4) 저장 경로 반환 ---------------------------------------------------
+        return dest_path

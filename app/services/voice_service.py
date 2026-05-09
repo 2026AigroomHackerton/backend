@@ -3,57 +3,47 @@
 # voice_service.py — 음성/텍스트 명령 도메인 비즈니스 로직 계층.
 #
 # [책임]
-#   - 음성 파일을 텍스트로 변환 (STT, OpenAI Whisper)
-#   - 음성/텍스트 명령 저장 / 이력 조회 (Mock — DB 미연동)
+#   - 오디오 파일 검증 (validate_audio)
+#   - 오디오 파일 디스크 저장 (save_audio)
+#   - OpenAI Whisper STT 호출 (transcribe_audio) — graceful fallback
+#   - voice_commands 저장 / 조회 (DB 미연동 — 메모리 dict 폴백)
 #
 # [real path]
-#   - transcribe_audio(): OPENAI_API_KEY 가 있으면 Whisper(`whisper-1`) 호출.
+#   - OPENAI_API_KEY 가 .env 에 있으면 openai.AsyncOpenAI 로 Whisper 호출.
 #
-# [mock path — fallback]
-#   - 키가 없거나 Whisper 호출이 실패하면 명세 더미 transcript 로 폴백.
-#   - create_voice_command / list_voice_commands 는 DB 미연동이라 Mock 유지.
-#     실제 구현 시 메서드 본문만 교체하면 라우터는 영향 없음.
+# [graceful fallback — 명세 [전제 조건] ]
+#   - 키 없음     : {"transcript": "", "error": "openai_key_missing", "language": "ko"}
+#   - API 호출 실패: {"transcript": "", "error": "<메시지>",       "language": "ko"}
+#   - 둘 다 서버를 절대 죽이지 않는다 (라우터에서 500 응답으로 변환).
+#
+# [DB 미연동]
+#   - DB 모델 절대 수정 금지 영역이라, save_command_to_db / get_commands_from_db
+#     는 클래스 속성 메모리 리스트(_IN_MEMORY_COMMANDS) 에 보관한다.
+#   - 추후 실제 DB 연동 시 본 메서드들 본문만 교체하면 라우터는 영향 없음.
 # =============================================================================
 
+# 타입 힌트의 지연 평가. 팀 표준.
 from __future__ import annotations
 
-import asyncio
-import io
-import logging
+# 표준 라이브러리.
+import logging          # Whisper 실패 등 비치명적 오류 로깅
+import os               # 환경변수 / 디렉토리 생성 / 경로 결합
+import uuid             # voice_command_id 생성용 (uuid4)
+from datetime import datetime, timezone  # 파일명 timestamp / created_at ISO
+from pathlib import Path                  # filename sanitize (디렉토리 트래버설 차단)
 from typing import Any
 
+# FastAPI: UploadFile 타입만 import (라우터가 넘겨주는 객체).
 from fastapi import UploadFile
 
-# OpenAI 클라이언트 싱글톤. 키 없으면 None.
-from app.core.openai_client import get_client
+# .env 로드를 위한 부수 효과 import.
+# config 모듈이 import 시점에 dotenv.load_dotenv() 를 호출하므로,
+# 본 모듈이 처음 import 되는 순간 OPENAI_API_KEY 가 os.environ 에 들어와 있다.
+# (config 자체의 상수는 직접 안 쓰므로 noqa: F401 로 lint 경고 억제.)
+from app.core import config  # noqa: F401  — env 로딩 보장 목적
 
+# 모듈 전용 로거.
 logger = logging.getLogger(__name__)
-
-
-# -----------------------------------------------------------------------------
-# 더미 transcript / 콘텐츠 타입 화이트리스트 / Whisper 모델명
-# -----------------------------------------------------------------------------
-# Mock 폴백에서 반환할 더미 transcript. 사양서 list_voice_commands 예시와 동일.
-DUMMY_TRANSCRIPT = "환경정화 활동으로 바꿔줘"
-
-# Whisper 가 받을 수 있는 일반적인 오디오 MIME 타입.
-# - mp3, m4a, mp4, wav, webm, ogg, flac
-# - 라우터에서 화이트리스트 검증.
-ALLOWED_AUDIO_CONTENT_TYPES: set[str] = {
-    "audio/mpeg",       # mp3
-    "audio/mp3",        # 비표준이지만 일부 클라이언트가 보냄
-    "audio/mp4",        # mp4 컨테이너
-    "audio/m4a",        # 비표준 별칭
-    "audio/x-m4a",
-    "audio/wav",
-    "audio/x-wav",
-    "audio/webm",
-    "audio/ogg",
-    "audio/flac",
-}
-
-# 사용할 Whisper 모델. 현재는 단일 모델만 노출.
-OPENAI_MODEL_STT = "whisper-1"
 
 
 # =============================================================================
@@ -63,114 +53,226 @@ class VoiceService:
     """음성/텍스트 명령 비즈니스 로직 클래스.
 
     제공 메서드:
-        - transcribe_audio(audio_file)             : 음성 → 텍스트 (real or mock).
-        - create_voice_command(...)                : 새 명령 저장 (Mock — DB TODO).
-        - list_voice_commands(document_id)         : 명령 이력 조회 (Mock — DB TODO).
+        - validate_audio(file)                              : 오디오 MIME 검증.
+        - save_audio(file)            -> str                : 디스크 저장 후 경로 반환.
+        - transcribe_audio(audio_path)-> dict               : Whisper STT (graceful).
+        - generate_command_id()       -> str                : "vc_" + uuid4[:8].
+        - save_command_to_db(...)     -> dict               : 저장 (메모리 폴백).
+        - get_commands_from_db(doc_id)-> list[dict]         : 조회 (메모리 폴백).
     """
 
     # =========================================================================
-    # Public: transcribe_audio — Whisper 우선, 실패 시 mock 폴백
+    # 클래스 속성 — 명세에 명시된 화이트리스트와 디렉토리 상수
     # =========================================================================
-    async def transcribe_audio(self, audio_file: UploadFile) -> dict[str, Any]:
-        """음성 파일을 텍스트로 변환한다.
+    # 허용 오디오 콘텐츠 타입 (명세 [전제 조건] 그대로 7종).
+    # 라우터에서 INVALID_FILE_TYPE 검증에 사용.
+    # list 로 두는 이유: 명세가 list 로 못 박았고, 외부에서 문서화/직렬화할 때
+    # 안정적인 출력 순서를 갖게 한다.
+    ALLOWED_AUDIO_TYPES: list[str] = [
+        "audio/mpeg",
+        "audio/mp4",
+        "audio/wav",
+        "audio/webm",
+        "audio/ogg",
+        "audio/flac",
+        "audio/x-m4a",
+    ]
 
-        키가 있으면 Whisper STT, 없거나 실패 시 더미 transcript 폴백.
-        응답 스키마는 두 경로 동일 ({transcript, audio_filename, _source, ...}).
+    # 오디오 저장 루트. 프로세스 CWD(보통 프로젝트 루트) 기준 상대 경로.
+    # save_audio() 가 첫 호출 시 os.makedirs(exist_ok=True) 로 자동 생성.
+    VOICE_DIR: str = "uploads/voice"
+
+    # =========================================================================
+    # 메모리 fallback 저장소.
+    # - DB 미연동 환경에서 commands 이력을 임시 보관.
+    # - 클래스 속성으로 두어 모든 인스턴스가 동일 리스트를 공유.
+    #   (라우터에서 모듈 싱글톤 인스턴스를 쓰므로 사실상 1개의 리스트)
+    # =========================================================================
+    _IN_MEMORY_COMMANDS: list[dict[str, Any]] = []
+
+    # =========================================================================
+    # validate_audio
+    # =========================================================================
+    def validate_audio(self, file: UploadFile) -> None:
+        """오디오 콘텐츠 타입 화이트리스트 검증.
+
+        명세에 따라 검증 실패 시 ValueError 를 발생시키고,
+        라우터(voice.py) 가 이를 잡아 INVALID_FILE_TYPE 400 으로 변환한다.
+
+        Raises:
+            ValueError: content_type 이 ALLOWED_AUDIO_TYPES 에 없을 때.
         """
-        audio_bytes = await audio_file.read()
-        # OpenAI SDK 가 파일 확장자로 포맷을 추정하므로 filename 보존이 중요.
-        filename = audio_file.filename or "audio.mp3"
+        if file.content_type not in self.ALLOWED_AUDIO_TYPES:
+            raise ValueError(
+                f"unsupported audio content_type: {file.content_type!r}"
+            )
 
-        client = get_client()
-        if client is not None:
-            try:
-                text = await asyncio.to_thread(
-                    self._call_openai_whisper, audio_bytes, filename
+    # =========================================================================
+    # save_audio
+    # =========================================================================
+    async def save_audio(self, file: UploadFile) -> str:
+        """업로드된 오디오 파일을 디스크에 저장하고 경로를 돌려준다.
+
+        저장 위치: VOICE_DIR/<timestamp>_<원본파일명>
+            - timestamp 는 마이크로초까지 포함하여 동시 업로드의 충돌을 줄인다.
+            - 원본 파일명은 Path(name).name 으로 디렉토리 부분을 제거 (트래버설 방어).
+
+        Returns:
+            저장된 파일의 상대 경로 문자열.
+        """
+        # 디렉토리 자동 생성. 이미 있으면 무시.
+        os.makedirs(self.VOICE_DIR, exist_ok=True)
+
+        # 원본 파일명 안전화.
+        # - filename 이 None 이면 기본 "audio.mp3" 사용.
+        # - 슬래시/백슬래시가 들어와도 Path(...).name 으로 마지막 컴포넌트만 추출.
+        original_name = file.filename or "audio.mp3"
+        safe_name = Path(original_name).name or "audio.mp3"
+
+        # 파일명 충돌 회피용 timestamp prefix.
+        # 마이크로초까지 포함해 같은 초에 여러 요청이 들어와도 거의 충돌 없음.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        save_name = f"{timestamp}_{safe_name}"
+
+        # os.path.join 은 OS 별 separator 를 자동 처리.
+        save_path = os.path.join(self.VOICE_DIR, save_name)
+
+        # 비동기 read() 로 전체 바이트를 읽어 디스크에 기록.
+        # 큰 파일의 경우 chunk 단위 스트리밍이 이상적이나, 해커톤 MVP 단계에서는
+        # 단순한 일괄 저장으로 충분.
+        content = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(content)
+        return save_path
+
+    # =========================================================================
+    # transcribe_audio
+    # =========================================================================
+    async def transcribe_audio(self, audio_path: str) -> dict[str, Any]:
+        """OpenAI Whisper API 로 STT 수행.
+
+        명세 응답 스키마:
+            성공     : {"transcript": "...", "language": "ko"}
+            키 없음  : {"transcript": "", "error": "openai_key_missing", "language": "ko"}
+            API 실패 : {"transcript": "", "error": "<예외 메시지>",     "language": "ko"}
+
+        Returns:
+            위 스키마를 따르는 dict. 라우터가 "error" 키 유무로 분기한다.
+        """
+        # 1) 키 부재 graceful fallback.
+        #    config 모듈이 .env 를 이미 로드했으므로 os.getenv 면 충분.
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {
+                "transcript": "",
+                "error": "openai_key_missing",
+                "language": "ko",
+            }
+
+        # 2) 실제 Whisper 호출.
+        try:
+            # AsyncOpenAI 는 가벼운 래퍼라 호출마다 인스턴스화해도 무방.
+            # (싱글톤화는 app.core.openai_client 의 동기 클라이언트와 분리하여
+            #  운영. 본 서비스는 async 라우트라 AsyncOpenAI 를 쓴다.)
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(api_key=api_key)
+
+            # 명세 그대로의 호출 형태. 파일을 binary 로 열어 SDK 에 그대로 전달.
+            # SDK 가 multipart 업로드 + 확장자 감지를 처리.
+            with open(audio_path, "rb") as f:
+                result = await client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language="ko",
                 )
-                return {
-                    "transcript": text or DUMMY_TRANSCRIPT,
-                    "audio_filename": filename,
-                    "_source": "openai_whisper",
-                    "_model": OPENAI_MODEL_STT,
-                }
-            except Exception as exc:  # noqa: BLE001 — 폴백 대상
-                logger.warning("Whisper STT 실패 → mock 폴백: %s", exc)
-                return {
-                    "transcript": DUMMY_TRANSCRIPT,
-                    "audio_filename": filename,
-                    "_source": "mock_fallback",
-                    "_error": str(exc),
-                }
 
-        # 키 없음 → 순수 mock.
-        return {
-            "transcript": DUMMY_TRANSCRIPT,
-            "audio_filename": filename,
-            "_source": "mock",
-        }
+            # result.text 가 None 일 가능성에 대비해 빈 문자열로 보정.
+            return {
+                "transcript": result.text or "",
+                "language": "ko",
+            }
+        except Exception as exc:  # noqa: BLE001 — 명세상 graceful fallback
+            # 네트워크/쿼터/만료 등 모든 실패를 dict 응답으로 변환.
+            # logger.warning 으로 진단은 남기되, 호출자(라우터)가 500 으로 변환.
+            logger.warning("Whisper STT 호출 실패: %s", exc)
+            return {
+                "transcript": "",
+                "error": str(exc),
+                "language": "ko",
+            }
 
     # =========================================================================
-    # Public: create_voice_command / list_voice_commands (DB TODO — Mock 유지)
+    # generate_command_id
     # =========================================================================
-    def create_voice_command(
+    def generate_command_id(self) -> str:
+        """voice_command_id 를 생성한다.
+
+        명세: "vc_" + uuid4 의 hex 앞 8자리.
+        예) "vc_3f9a82c1"
+        """
+        # uuid4().hex 는 32자리 16진수 문자열. 앞 8자리만 사용해도
+        # 데모 규모(요청 수십~수백 건)에서는 충돌 확률이 극히 낮음.
+        return f"vc_{uuid.uuid4().hex[:8]}"
+
+    # =========================================================================
+    # save_command_to_db
+    # =========================================================================
+    async def save_command_to_db(
         self,
         document_id: str,
         transcript: str,
         input_type: str,
+        audio_path: str | None = None,
     ) -> dict[str, Any]:
-        """새 음성/텍스트 명령을 "저장한 척" 하고 결과를 반환 (Mock).
+        """음성/텍스트 명령 레코드를 저장한다.
 
         TODO(DB 연동):
-            1) DB 세션을 받아 VoiceCommand 레코드 INSERT
-            2) 생성된 PK(voice_command_id) 반환
-            현재 단계에서는 DB 모델 절대 수정 금지 영역이라 Mock.
+            DB 모델(voice_commands 테이블) 이 도입되면 다음 절차로 교체:
+                INSERT INTO voice_commands (...) VALUES (...)
+            현재는 DB 모델 절대 수정 금지 영역이므로 클래스 속성 메모리 리스트로 보관.
+
+        Returns:
+            {voice_command_id, document_id, transcript, input_type,
+             audio_path, status, created_at} 의 dict.
         """
-        return {
-            "voice_command_id": "vc_001",
+        record: dict[str, Any] = {
+            "voice_command_id": self.generate_command_id(),
             "document_id": document_id,
             "transcript": transcript,
             "input_type": input_type,
-            "status": "accepted",
+            "audio_path": audio_path,
+            # 저장 직후 상태. /transcribe 라우트는 응답에서 "transcribed" 로
+            # 덮어쓰지만, /commands POST 는 "received" 그대로 사용.
+            "status": "received",
+            # ISO 8601 형식 (UTC). 프론트가 toLocaleString 등으로 변환하기 쉬움.
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        # 메모리 리스트에 append. (실제 DB INSERT 의 자리)
+        self._IN_MEMORY_COMMANDS.append(record)
+        return record
 
-    def list_voice_commands(self, document_id: str) -> list[dict[str, Any]]:
-        """특정 문서의 명령 이력을 조회 (Mock).
+    # =========================================================================
+    # get_commands_from_db
+    # =========================================================================
+    async def get_commands_from_db(self, document_id: str) -> list[dict[str, Any]]:
+        """document_id 기준 명령 이력을 조회한다.
 
         TODO(DB 연동):
-            SELECT * FROM voice_commands WHERE document_id=:document_id
-            ORDER BY created_at DESC
+            SELECT * FROM voice_commands
+             WHERE document_id = :document_id
+             ORDER BY created_at DESC
+            현재는 메모리 리스트에서 동일 document_id 항목만 필터링.
+
+        Returns:
+            저장된 record dict 의 리스트. 없으면 빈 리스트.
         """
-        return [
-            {
-                "command_id": "vc_001",
-                "transcript": DUMMY_TRANSCRIPT,
-            }
+        # 동일 document_id 인 레코드만 필터.
+        # 정렬은 created_at 내림차순 (최신순).
+        items = [
+            cmd
+            for cmd in self._IN_MEMORY_COMMANDS
+            if cmd.get("document_id") == document_id
         ]
-
-    # =========================================================================
-    # Internal: Whisper 동기 호출
-    # =========================================================================
-    def _call_openai_whisper(self, audio_bytes: bytes, filename: str) -> str:
-        """OpenAI Whisper 로 audio bytes → text.
-
-        [동기 메서드]
-            transcribe_audio() 가 asyncio.to_thread 로 감싸 호출.
-
-        [파일 객체 요건]
-            OpenAI SDK 는 file-like 객체를 받으며, 확장자로 포맷을 추정한다.
-            BytesIO 에 .name 을 직접 부여해 SDK 가 ".mp3"/".wav" 등을 알 수 있게 한다.
-        """
-        client = get_client()
-        if client is None:
-            raise RuntimeError("OpenAI client is not configured")
-
-        bio = io.BytesIO(audio_bytes)
-        # SDK 의 multipart 업로더가 .name 을 읽어 확장자 기반으로 포맷 결정.
-        bio.name = filename
-
-        result = client.audio.transcriptions.create(
-            model=OPENAI_MODEL_STT,
-            file=bio,
-        )
-        # SDK 응답은 .text 속성을 가진 객체.
-        return getattr(result, "text", "") or ""
+        items.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+        return items
