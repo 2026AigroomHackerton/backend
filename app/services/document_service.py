@@ -466,6 +466,13 @@ def get_document(document_id: int, user_id: int) -> dict:
     # ---- versions 블록: document_versions 전체 이력 ----
     versions = document_repository.list_document_versions(document_id=document_id)
 
+    # ---- fields 블록: 자동 채움이 만든 extracted_fields 행 ----
+    # 라벨/제안값/신뢰도/상태가 한 dict 에 평탄화되어 있어 프런트가 그대로 렌더링 가능.
+    from app.repositories import extracted_field_repository  # 지연 import
+    fields = extracted_field_repository.list_fields_by_document(
+        document_id=document_id
+    )
+
     # ---- 응답 nested 구조 ----
     return {
         "metadata": {
@@ -479,9 +486,8 @@ def get_document(document_id: int, user_id: int) -> dict:
             "folder_id": row.get("folder_id"),
         },
         "text": text_block,
-        # TODO: 폼 필드/답변 schema (document_fields, document_answers) 가 추가되면
-        #   repository 함수로 조회해 채울 것. 현재는 명세 호환을 위해 빈 배열.
-        "fields": [],
+        "fields": fields,
+        # TODO: answer_histories schema 가 추가되면 채울 것.
         "answers": [],
         "versions": versions,
     }
@@ -648,9 +654,28 @@ def reindex_document(
             document_id=document_id
         )
 
-    # ---- 4) 응답 ----
-    # TODO: document_fields 등 schema 추가 후 fields 채울 것.
+    # ---- 4) 자동 채움 (force=True 일 때만 재실행) ------------------------
+    # force=False 면 단순 조회라 stale 한 fields 도 그대로 반환해야 한다.
+    # force=True 일 때 프로필이 바뀌었거나 텍스트가 바뀌었을 가능성이 있어 재계산.
+    if force and text_record is not None:
+        try:
+            from app.services import autofill_service  # 지연 import
+            autofill_service.autofill_document(
+                document_id=document_id,
+                user_id=user_id,
+                extracted_text=text_record.get("extracted_text"),
+            )
+        except Exception:  # noqa: BLE001 — 자동 채움 실패가 reindex 응답을 막지 않게
+            pass
+
+    # ---- 5) 응답 ---------------------------------------------------------
+    # extracted_fields 행을 응답 fields[] 로 노출.
+    from app.repositories import extracted_field_repository  # 지연 import
+    fields = extracted_field_repository.list_fields_by_document(
+        document_id=document_id
+    )
+
     return {
         "document_texts": text_record,
-        "fields": [],
+        "fields": fields,
     }

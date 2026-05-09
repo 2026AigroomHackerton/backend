@@ -59,10 +59,23 @@ class DemoProfile(Base):
     user_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("demo_users.id"), primary_key=True
     )
+    # 자동 채움 기능에서 양식 빈칸을 채울 10개 정보 슬롯.
+    # 셋 다 보관해 라벨이 영문/한자/한글 어느 쪽으로 와도 매칭 가능하도록 분리.
     name_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name_en: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name_hanja: Mapped[str | None] = mapped_column(Text, nullable=True)
     phone: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 주민등록번호 — 시연 MVP 한정 평문 보관. 실서비스 전환 시 암호화 또는 보관 자체 제거.
+    rrn: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 자격증 — JSON 배열 문자열. 각 원소: {name, acquired_date, cert_number, issuer}.
+    # SQLite native JSON 미지원이라 TEXT 로 보관, 직렬화/역직렬화는 service 계층 책임.
+    certifications: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 직업 — '직장인' / '학생' / '프리랜서' 등 자유 문자열.
+    occupation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 성별 — 'male' / 'female' / '기타' 등 자유 문자열 (enum 미강제).
+    gender: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # =============================================================================

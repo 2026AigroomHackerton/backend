@@ -135,6 +135,19 @@ def init_db() -> None:
         ("file_path", "TEXT"),
     ]
 
+    # demo_profiles 보강 — 자동 채움 기능을 위해 6개 컬럼 추가.
+    # 기존 prod DB 에 이미 demo_profiles 가 4컬럼(name_ko/phone/email/address) 으로
+    # 만들어져 있으므로 create_all 만으로는 채워지지 않는다.
+    demo_profiles_cols = _existing_columns("demo_profiles")
+    demo_profiles_alters: list[tuple[str, str]] = [
+        ("name_en", "TEXT"),
+        ("name_hanja", "TEXT"),
+        ("rrn", "TEXT"),
+        ("certifications", "TEXT"),
+        ("occupation", "TEXT"),
+        ("gender", "TEXT"),
+    ]
+
     # 실제 ALTER 실행. 한 트랜잭션으로 묶어 실패 시 롤백.
     with engine.begin() as conn:
         for col_name, col_type in documents_alters:
@@ -153,7 +166,79 @@ def init_db() -> None:
                     )
                 )
 
+        for col_name, col_type in demo_profiles_alters:
+            if col_name not in demo_profiles_cols:
+                logger.info("ALTER TABLE demo_profiles ADD COLUMN %s", col_name)
+                conn.execute(
+                    text(
+                        f"ALTER TABLE demo_profiles ADD COLUMN {col_name} {col_type}"
+                    )
+                )
+
+    # ---- 3) 데모 사용자/프로필 시드 ------------------------------------------
+    # 인증이 없는 MVP 환경에서 라우터들이 user_id=1 을 고정으로 사용한다.
+    # 해당 행이 없으면 매번 FK/SELECT 실패가 나므로 부팅 시 INSERT OR IGNORE 한다.
+    _seed_demo_user_and_profile()
+
     logger.info("init_db 완료: %d개 테이블 등록 (DB=%s)", len(Base.metadata.tables), DB_PATH)
+
+
+def _seed_demo_user_and_profile() -> None:
+    """user_id=1 데모 사용자/프로필을 멱등 INSERT 한다.
+
+    - demo_users 에 동일 PK 가 없으면 한 행 추가 (이후 모든 라우터가 가정).
+    - demo_profiles 에 동일 PK 가 없으면 자동 채움 데모용 프로필을 한 행 추가.
+    - 이미 존재하면 INSERT OR IGNORE 가 NO-OP 처리.
+
+    시연 데이터는 실제 한국 법적 식별번호와 무관한 더미값(900101-1234567 등) 으로 채운다.
+    """
+    from datetime import datetime, timezone
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 자격증 4개 필드 모두 채운 데모 JSON. service 계층에서 json.loads/dumps 로 다룸.
+    demo_certifications = (
+        '[{"name": "정보처리기사", "acquired_date": "2024-03-15", '
+        '"cert_number": "24-A1234567", "issuer": "한국산업인력공단"}, '
+        '{"name": "TOEIC", "acquired_date": "2025-01-20", '
+        '"cert_number": "TX-987654", "issuer": "ETS"}]'
+    )
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO demo_users (id, name, email, created_at) "
+                "VALUES (:id, :name, :email, :created_at)"
+            ),
+            {
+                "id": 1,
+                "name": "데모유저",
+                "email": "demo@example.com",
+                "created_at": now_iso,
+            },
+        )
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO demo_profiles "
+                "(user_id, name_ko, name_en, name_hanja, phone, email, "
+                " address, rrn, certifications, occupation, gender) "
+                "VALUES (:user_id, :name_ko, :name_en, :name_hanja, :phone, :email, "
+                "        :address, :rrn, :certifications, :occupation, :gender)"
+            ),
+            {
+                "user_id": 1,
+                "name_ko": "홍길동",
+                "name_en": "Hong Gildong",
+                "name_hanja": "洪吉童",
+                "phone": "010-1234-5678",
+                "email": "demo@example.com",
+                "address": "서울특별시 강남구 테헤란로 123, 4층",
+                "rrn": "900101-1234567",
+                "certifications": demo_certifications,
+                "occupation": "직장인",
+                "gender": "male",
+            },
+        )
 
 
 # =============================================================================

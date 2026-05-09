@@ -418,6 +418,23 @@ class OcrService:
             )
 
             db.commit()
+
+            # ----- 자동 채움 트리거 -----------------------------------------
+            # OCR 로 본문이 막 들어왔으니 양식 빈칸 검출 → extracted_fields 생성.
+            # 실패해도 OCR 응답 자체에는 영향이 없도록 광범위 catch.
+            try:
+                from app.services import autofill_service  # 지연 import (순환 방지)
+                autofill_service.autofill_document(
+                    document_id=int(new_document_id),
+                    user_id=1,
+                    extracted_text=extracted_text,
+                )
+            except Exception as autofill_exc:  # noqa: BLE001
+                logger.warning(
+                    "자동 채움 트리거 실패 (document_id=%s): %s",
+                    new_document_id, autofill_exc,
+                )
+
             return int(new_document_id)
 
         except Exception as exc:  # noqa: BLE001 — INSERT 실패해도 OCR 응답은 살림

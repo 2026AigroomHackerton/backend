@@ -28,7 +28,7 @@ from app.routers import voice as voice_router
 from app.routers import ai as ai_router
 
 # 백엔드 1 라우터 — 모듈을 직접 import (alias 없이) .router 로 접근.
-from app.routers import archive, documents
+from app.routers import archive, documents, profile
 
 
 app = FastAPI(
@@ -48,9 +48,10 @@ app.include_router(storage_router.router)
 app.include_router(voice_router.router)
 app.include_router(ai_router.router)
 
-# 백엔드 1: 문서 / 보관함
+# 백엔드 1: 문서 / 보관함 / 프로필
 app.include_router(documents.router)
 app.include_router(archive.router)
+app.include_router(profile.router)
 
 
 @app.get("/")
