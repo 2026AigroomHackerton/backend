@@ -231,13 +231,25 @@ def _connect() -> Iterator[sqlite3.Connection]:
 # ---------------------------------------------------------------------------
 # 메인 비즈니스 함수
 # ---------------------------------------------------------------------------
-async def upload_document(file: UploadFile, user_id: int) -> dict:
+async def upload_document(
+    file: UploadFile,
+    user_id: int,
+    title: str | None = None,
+    source_type: str = "upload",
+    folder_id: int | None = None,
+    category: str | None = None,
+) -> dict:
     """
     업로드된 파일을 검증·저장하고 DB 레코드를 만든 뒤 메타데이터를 반환한다.
 
     Args:
         file: FastAPI 가 멀티파트 폼에서 추출한 UploadFile.
         user_id: 데모 사용자 식별자 (해커톤 MVP 에서는 라우터에서 1 을 고정 주입).
+        title: 사용자 지정 문서 제목. 누락 시 None.
+        source_type: 출처 유형 (기본 "upload").
+        folder_id: 속할 폴더 ID. 누락 시 None.
+        category: (예약) 카테고리. 현재 documents 테이블에 컬럼이 없어 받기만 하고 무시.
+            TODO: documents 테이블에 category 컬럼 추가 후 INSERT 에 포함.
 
     Returns:
         생성된 문서 메타데이터 dict. 라우터는 이를 그대로 응답 `data` 필드에 넣는다.
@@ -247,6 +259,8 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
         EmptyFileError: 파일 크기가 0 일 때.
         FileTooLargeError: 파일 크기가 MAX_FILE_SIZE 초과일 때.
     """
+    # category 는 현 schema 에 컬럼이 없어 명시적으로 미사용 처리.
+    _ = category
 
     # ---- 1단계: 파일명/확장자 검증 ----
     # `file.filename` 은 클라이언트가 보낸 원본 이름. 누락 시 'unnamed' 로 대체.
@@ -292,12 +306,15 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
     created_at = datetime.now(timezone.utc).isoformat()
 
     with _connect() as conn:
+        # title / source_type / folder_id 도 INSERT 에 포함해야 명세 multipart 필드가
+        # 영속화된다. NULL 허용 컬럼이라 None 그대로 바인딩 가능.
         cursor = conn.execute(
             """
             INSERT INTO documents (
                 user_id, original_filename, stored_filename, file_path,
-                file_extension, file_size, content_type, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                file_extension, file_size, content_type, created_at,
+                title, source_type, folder_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -308,19 +325,24 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
                 file_size,
                 file.content_type,
                 created_at,
+                title,
+                source_type,
+                folder_id,
             ),
         )
         conn.commit()
-        # AUTOINCREMENT 로 발급된 새 PK.
-        # sqlite3 타입 스텁상 lastrowid 는 `int | None` 이라 그대로 쓰면
-        # Pylance 가 응답 dict 의 id 필드 타입을 'int | None' 으로 추론해 경고한다.
-        # INSERT 직후엔 None 이 나올 수 없으므로 assert 로 타입을 좁힌다.
         assert cursor.lastrowid is not None, "INSERT 직후 lastrowid 는 항상 존재해야 합니다."
         document_id = cursor.lastrowid
 
     # ---- 5단계: 응답용 메타데이터 반환 ----
-    # 라우터는 이 dict 를 `{"success": True, "data": <dict>}` 로 감싸 응답한다.
+    # 명세 [BE1 - Documents API] POST 응답 data 필드: document_id, file_type, parse_status.
+    # 호환을 위해 기존 키들도 유지하면서 명세 키를 추가로 노출한다.
     return {
+        # 명세 응답 핵심 키
+        "document_id": document_id,
+        "file_type": extension,
+        "parse_status": "pending",
+        # 추가/기존 메타 (기존 BE1 호출자 호환 + 디버깅 편의)
         "id": document_id,
         "user_id": user_id,
         "original_filename": original_filename,
@@ -330,6 +352,9 @@ async def upload_document(file: UploadFile, user_id: int) -> dict:
         "file_size": file_size,
         "content_type": file.content_type,
         "created_at": created_at,
+        "title": title,
+        "source_type": source_type,
+        "folder_id": folder_id,
     }
 
 
@@ -351,20 +376,32 @@ class DocumentNotFoundError(LookupError):
 # 모듈 최상단에서 import 하면 repository 가 service 의 다른 심볼을 참조할 때 충돌 가능.
 
 
-def list_documents(user_id: int) -> list[dict]:
+def list_documents(
+    user_id: int,
+    folder_id: int | None = None,
+    category: str | None = None,
+    source_type: str | None = None,
+) -> list[dict]:
     """
     특정 사용자의 활성(soft-delete 되지 않은) 문서 목록을 명세 응답 필드로 정제하여 반환한다.
 
     Args:
         user_id: 데모 사용자 식별자.
-
-    Returns:
-        명세서가 요구하는 필드로만 구성된 dict 들의 리스트.
-        필드: id, title, source_type, file_type, parse_status, created_at, updated_at
+        folder_id: documents.folder_id 일치 필터 (None 이면 전체).
+        category: (예약) documents 테이블에 컬럼 없음. 받기만 하고 무시.
+            TODO: documents 테이블에 category 컬럼 추가 후 활성화.
+        source_type: documents.source_type 일치 필터 (None 이면 전체).
     """
     from app.repositories import document_repository  # 지연 import
 
-    rows = document_repository.list_active_documents_by_user(user_id=user_id)
+    # category 는 schema 부재로 미사용. 명시적 표시.
+    _ = category
+
+    rows = document_repository.list_active_documents_by_user(
+        user_id=user_id,
+        folder_id=folder_id,
+        source_type=source_type,
+    )
     # DB 컬럼명(`file_extension`)을 응답 필드명(`file_type`)으로 매핑한다.
     # 응답 스펙은 추후 file_type 의 의미가 확장될 수 있으나(MIME 등),
     # 현재 단계에선 확장자 문자열을 그대로 노출.
@@ -384,14 +421,18 @@ def list_documents(user_id: int) -> list[dict]:
 
 def get_document(document_id: int, user_id: int) -> dict:
     """
-    단일 문서를 조회하여, document_texts 의 extracted_text 와 함께 반환한다.
+    단일 문서를 nested 구조(metadata/text/fields/answers/versions) 로 반환한다.
 
-    Args:
-        document_id: 조회 대상 문서의 PK.
-        user_id: 데모 사용자 식별자 (소유권 검증용).
-
-    Returns:
-        명세 응답 필드 + extracted_text(없으면 None) 가 포함된 dict.
+    명세 [BE1 - Documents API] GET /api/documents/{id} 응답 data:
+        {
+            "metadata": {id, title, source_type, file_type, parse_status,
+                         created_at, updated_at, folder_id},
+            "text":     {extracted_text, cleaned_text, summary, keywords,
+                         text_version, updated_at} | null,
+            "fields":   [],   # 폼 필드 — 현재 schema 부재로 빈 배열 (TODO).
+            "answers":  [],   # 폼 답변 — 현재 schema 부재로 빈 배열 (TODO).
+            "versions": [{id, version_no, text_snapshot, created_by, created_at}, ...]
+        }
 
     Raises:
         DocumentNotFoundError: 해당 id 의 문서가 없거나, 다른 사용자의 것이거나, soft-delete 된 경우.
@@ -406,18 +447,43 @@ def get_document(document_id: int, user_id: int) -> dict:
             f"문서 #{document_id} 를 찾을 수 없습니다."
         )
 
-    # repository 가 documents + document_texts 조인 결과를 평탄화한 dict 를 돌려주므로,
-    # 여기서는 응답 스키마에 맞게 필요한 필드만 골라낸다.
+    # ---- text 블록: document_texts 최신 한 행 ----
+    # repository.get_document_text_record 로 컬럼 일체 조회.
+    text_record = document_repository.get_document_text_record(document_id=document_id)
+    text_block = (
+        {
+            "extracted_text": text_record["extracted_text"],
+            "cleaned_text": text_record["cleaned_text"],
+            "summary": text_record["summary"],
+            "keywords": text_record["keywords"],
+            "text_version": text_record["text_version"],
+            "updated_at": text_record["updated_at"],
+        }
+        if text_record is not None
+        else None
+    )
+
+    # ---- versions 블록: document_versions 전체 이력 ----
+    versions = document_repository.list_document_versions(document_id=document_id)
+
+    # ---- 응답 nested 구조 ----
     return {
-        "id": row["id"],
-        "title": row["title"],
-        "source_type": row["source_type"],
-        "file_type": row["file_extension"],
-        "parse_status": row["parse_status"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        # document_texts 가 없으면 None 으로 통일 (명세 요구사항).
-        "extracted_text": row.get("extracted_text"),
+        "metadata": {
+            "id": row["id"],
+            "title": row["title"],
+            "source_type": row["source_type"],
+            "file_type": row["file_extension"],
+            "parse_status": row["parse_status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "folder_id": row.get("folder_id"),
+        },
+        "text": text_block,
+        # TODO: 폼 필드/답변 schema (document_fields, document_answers) 가 추가되면
+        #   repository 함수로 조회해 채울 것. 현재는 명세 호환을 위해 빈 배열.
+        "fields": [],
+        "answers": [],
+        "versions": versions,
     }
 
 
@@ -521,4 +587,70 @@ def update_document_text(
         "version_id": version_id,
         "version_no": next_version_no,
         "updated_at": now_iso,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 재인덱싱 서비스 함수 (POST /api/documents/{id}/reindex)
+# ---------------------------------------------------------------------------
+def reindex_document(
+    document_id: int,
+    user_id: int,
+    force: bool = False,
+) -> dict:
+    """
+    문서 텍스트를 재인덱싱한다 (시뮬레이션).
+
+    실제 OCR/AI 재실행은 본 PR 범위 외. 명세 응답 스키마(`document_texts` + `fields`)
+    를 만족시키기 위해 다음 로직을 수행한다:
+        - 문서 존재/소유권 검증 → 미존재 시 DocumentNotFoundError
+        - force=True: document_texts.text_version 을 +1 하고 updated_at 을 갱신
+                      (extracted_text 자체는 변경하지 않음)
+        - force=False: 현재 document_texts 상태를 그대로 반환
+
+    Returns:
+        {
+            "document_texts": {id, document_id, extracted_text, cleaned_text,
+                               summary, keywords, text_version, updated_at} | null,
+            "fields": []   # schema 부재로 빈 배열 (TODO)
+        }
+    """
+    from app.repositories import document_repository  # 지연 import
+
+    # ---- 1) 문서 존재/소유권 검증 ----
+    if not document_repository.document_exists_for_user(
+        document_id=document_id, user_id=user_id
+    ):
+        raise DocumentNotFoundError(
+            f"문서 #{document_id} 를 찾을 수 없습니다."
+        )
+
+    # ---- 2) 현재 document_texts 조회 ----
+    text_record = document_repository.get_document_text_record(document_id=document_id)
+
+    # ---- 3) force=True 인 경우 text_version 강제 증가 ----
+    # extracted_text 는 그대로 두고 메타데이터만 갱신해 "재처리됐음" 표시.
+    if force and text_record is not None:
+        new_version = int(text_record["text_version"]) + 1
+        now_iso = datetime.now(timezone.utc).isoformat()
+        document_repository.update_document_text(
+            text_id=text_record["id"],
+            extracted_text=text_record["extracted_text"] or "",
+            text_version=new_version,
+            updated_at=now_iso,
+        )
+        # documents.updated_at 도 동기 갱신 (다른 라우트와 일관)
+        document_repository.update_document_updated_at(
+            document_id=document_id, updated_at=now_iso
+        )
+        # 갱신된 행을 다시 읽어 최신 상태 응답
+        text_record = document_repository.get_document_text_record(
+            document_id=document_id
+        )
+
+    # ---- 4) 응답 ----
+    # TODO: document_fields 등 schema 추가 후 fields 채울 것.
+    return {
+        "document_texts": text_record,
+        "fields": [],
     }

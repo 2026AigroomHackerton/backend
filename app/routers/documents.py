@@ -19,7 +19,7 @@ API 공통 규칙(명세서 기준):
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, UploadFile, status
+from fastapi import APIRouter, File, Form, Query, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -56,41 +56,45 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 # 따라서 라우터 내부에서 직접 JSONResponse 를 반환하여 포맷을 강제한다.
 def _success_response(data, status_code: int = status.HTTP_200_OK) -> JSONResponse:
     """
-    성공 응답 빌더.
+    성공 응답 빌더 — 통합 공통 envelope 4-key.
+
+    공통 응답 스펙:
+        {"success": bool, "data": dict|null, "message": str, "error": str|null}
 
     Args:
-        data: 응답 본문 `data` 필드에 들어갈 값. dict 또는 list 등 JSON 직렬화 가능 타입.
-            (목록 조회는 list, 단일 조회/생성은 dict 가 들어온다.)
-        status_code: HTTP 상태 코드. 기본 200, 리소스 생성 시 201 등으로 호출자가 지정.
-
-    Returns:
-        `{"success": True, "data": data}` 형태의 JSONResponse.
+        data: 응답 본문 `data` 필드에 들어갈 값. dict / list / None 모두 허용.
+        status_code: HTTP 상태 코드. 기본 200, 리소스 생성 시 201 등.
     """
     return JSONResponse(
         status_code=status_code,
-        content={"success": True, "data": data},
+        content={
+            "success": True,
+            "data": data,
+            "message": "",
+            "error": None,
+        },
     )
 
 
 def _error_response(message: str, code: str, status_code: int) -> JSONResponse:
     """
-    에러 응답 빌더.
+    에러 응답 빌더 — 통합 공통 envelope 4-key.
 
-    명세 형식: `{"success": False, "data": {"code": "<에러 코드>", "message": "<설명>"}}`
+    이전 형식(`data` 안에 code/message 패킹) 에서 통합 envelope 으로 이전:
+        {"success": False, "data": null, "message": <설명>, "error": <CODE>}
 
     Args:
         message: 사용자/개발자에게 보일 한국어 메시지.
-        code: 클라이언트가 분기 처리하기 좋은 영문 에러 코드 (예: "UNSUPPORTED_FILE_TYPE").
+        code: 클라이언트 분기용 영문 에러 코드 (예: "UNSUPPORTED_FILE_TYPE").
         status_code: HTTP 상태 코드 (400, 413 등).
-
-    Returns:
-        명세 형식의 JSONResponse.
     """
     return JSONResponse(
         status_code=status_code,
         content={
             "success": False,
-            "data": {"code": code, "message": message},
+            "data": None,
+            "message": message,
+            "error": code,
         },
     )
 
@@ -101,25 +105,23 @@ def _error_response(message: str, code: str, status_code: int) -> JSONResponse:
 @router.post("/upload")
 async def upload_document(
     file: UploadFile | None = File(default=None),
+    # 명세 [BE1 - Documents API] 의 추가 multipart 필드.
+    # 누락 가능(optional) 이라 기본값을 None / 'upload' 로 둔다.
+    title: str | None = Form(default=None, description="사용자 지정 문서 제목"),
+    source_type: str = Form(default="upload", description="출처 유형 (upload/mock/...)"),
+    folder_id: int | None = Form(default=None, description="속할 폴더 ID"),
+    category: str | None = Form(default=None, description="(예약) 카테고리"),
 ) -> JSONResponse:
     """
     문서 업로드 엔드포인트.
 
-    클라이언트는 multipart/form-data 형식으로 `file` 필드에 파일을 담아 전송한다.
-    서버는 다음 작업을 수행한다.
-        1. 파일이 첨부되었는지 확인
-        2. 서비스 계층에 위임하여 파일 저장 + DB 메타데이터 기록
-        3. 결과를 명세 형식으로 감싸 응답
-            - 성공: 201 Created + {"success": true, "data": <메타데이터>}
-            - 실패: 4xx/5xx + {"success": false, "data": {"code": ..., "message": ...}}
+    명세 multipart 필드: file(필수), title?, source_type?, folder_id?, category?
+    `category` 는 현재 documents 테이블에 컬럼이 없어 본 PR 에서는 받기만 하고 무시한다.
+        TODO: documents 테이블에 category 컬럼 추가 후 service 에 전달.
 
-    Args:
-        file: 업로드된 파일.
-            `File(default=None)` 으로 두어 누락 시 FastAPI 의 기본 422 검증 응답이 아니라
-            라우터 내부에서 명세 형식으로 400 에러를 반환할 수 있게 한다.
-
-    Returns:
-        명세 형식의 JSONResponse.
+    응답: 통합 envelope 4-key (success, data, message, error).
+        성공 시 data: 생성된 문서 메타데이터 dict.
+        실패 시 data=null, error=<CODE>, message=<설명>.
     """
 
     # ---- 파일 누락 방어 ----
@@ -135,7 +137,12 @@ async def upload_document(
     # ---- 비즈니스 로직 위임 + 도메인 예외 변환 ----
     try:
         document = await document_service.upload_document(
-            file=file, user_id=DEMO_USER_ID
+            file=file,
+            user_id=DEMO_USER_ID,
+            title=title,
+            source_type=source_type,
+            folder_id=folder_id,
+            category=category,
         )
     except UnsupportedFileTypeError as exc:
         # 클라이언트의 잘못된 입력 → 400 Bad Request
@@ -176,29 +183,39 @@ async def upload_document(
 # 엔드포인트: 문서 목록 조회
 # ---------------------------------------------------------------------------
 @router.get("")
-async def list_documents() -> JSONResponse:
+async def list_documents(
+    folder_id: int | None = Query(None, description="폴더 ID 필터"),
+    category: str | None = Query(None, description="(예약) 카테고리 필터"),
+    source_type: str | None = Query(None, description="출처 유형 필터"),
+) -> JSONResponse:
     """
     데모 사용자(`user_id=1`)의 활성 문서 목록을 반환한다.
 
     "활성" = soft-delete 되지 않은 (deleted_at IS NULL) 문서.
 
-    응답 data 는 각 문서별 dict 들의 리스트이며, 각 dict 는 다음 필드를 포함한다.
-        id, title, source_type, file_type, parse_status, created_at, updated_at
+    명세 [BE1 - Documents API] 쿼리 파라미터:
+        folder_id?    : documents.folder_id 일치 필터.
+        category?     : (예약) 현재 schema 에 컬럼 없음 → 받기만 하고 무시. TODO.
+        source_type?  : documents.source_type 일치 필터.
 
-    Returns:
-        성공 시 200 + {"success": true, "data": [...]}
-        예기치 못한 오류 시 500 + 명세 형식 에러
+    응답 data 는 각 문서별 dict 들의 리스트.
     """
     try:
-        documents = document_service.list_documents(user_id=DEMO_USER_ID)
+        documents = document_service.list_documents(
+            user_id=DEMO_USER_ID,
+            folder_id=folder_id,
+            category=category,
+            source_type=source_type,
+        )
     except Exception as exc:  # noqa: BLE001
-        # 운영에서는 여기서 로깅. MVP 라 메시지만 회피적으로 노출.
         return _error_response(
             message=f"문서 목록 조회 중 오류가 발생했습니다: {exc}",
             code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
+    # 명세에 맞춰 data 를 {documents: [...]} 로 nest 하지 않고 list 직접 반환 유지.
+    # (현 라우트의 응답 자료형이 documents[] 자체이므로 명세 "data: documents[]" 와 일치.)
     return _success_response(documents, status_code=status.HTTP_200_OK)
 
 
@@ -257,6 +274,18 @@ class UpdateDocumentTextRequest(BaseModel):
     edited_text: str
 
 
+class ReindexDocumentRequest(BaseModel):
+    """POST /api/documents/{document_id}/reindex 요청 바디.
+
+    명세 [BE1 - Documents API] reindex 요청: {force: boolean}.
+    force=False 면 이미 텍스트가 있을 때 재처리를 생략하고 현재 상태를 반환,
+    force=True 면 강제로 text_version 을 +1 하고 updated_at 을 갱신해 "재인덱싱"
+    효과를 시뮬레이션한다.
+    """
+
+    force: bool = False
+
+
 # ---------------------------------------------------------------------------
 # 엔드포인트: 문서 텍스트 수정 (버전 이력 기록)
 # ---------------------------------------------------------------------------
@@ -309,4 +338,48 @@ async def update_document_text(
         )
 
     # ---- 성공 응답 ----
+    return _success_response(result, status_code=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# 엔드포인트: 문서 재인덱싱
+# ---------------------------------------------------------------------------
+@router.post("/{document_id}/reindex")
+async def reindex_document(
+    document_id: int,
+    body: ReindexDocumentRequest,
+) -> JSONResponse:
+    """
+    문서 텍스트/필드를 재인덱싱한다.
+
+    명세 [BE1 - Documents API] POST /api/documents/{id}/reindex:
+        요청: {force: boolean}
+        응답: data = {document_texts: <갱신 후 dict>, fields: [...]}.
+
+    동작:
+        - force=False: document_texts 가 있으면 현재 상태 그대로 반환 (재처리 생략).
+        - force=True : document_texts.text_version 을 +1 하고 updated_at 을 갱신해
+                       재인덱싱 효과를 시뮬레이션 (실제 OCR 재실행은 본 PR 범위 외).
+
+    fields 는 schema 부재로 빈 배열 반환 (TODO).
+    """
+    try:
+        result = document_service.reindex_document(
+            document_id=document_id,
+            user_id=DEMO_USER_ID,
+            force=body.force,
+        )
+    except DocumentNotFoundError as exc:
+        return _error_response(
+            message=str(exc),
+            code="NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error_response(
+            message=f"문서 재인덱싱 중 오류가 발생했습니다: {exc}",
+            code="INTERNAL_SERVER_ERROR",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
     return _success_response(result, status_code=status.HTTP_200_OK)

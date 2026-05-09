@@ -74,20 +74,27 @@ EXTERNAL_PLACEHOLDERS: Final[list[dict[str, Any]]] = [
 # documents.py 수정이 금지된 본 작업의 제약상 import 해서 재사용하면 결합이 생기므로,
 # 라우터 단위로 가벼운 중복을 감수한다.
 def _success_response(data: Any, status_code: int = status.HTTP_200_OK) -> JSONResponse:
-    """`{"success": True, "data": data}` 형태의 JSONResponse 빌더."""
+    """통합 envelope 4-key 성공 응답: {success, data, message, error}."""
     return JSONResponse(
         status_code=status_code,
-        content={"success": True, "data": data},
+        content={
+            "success": True,
+            "data": data,
+            "message": "",
+            "error": None,
+        },
     )
 
 
 def _error_response(message: str, code: str, status_code: int) -> JSONResponse:
-    """`{"success": False, "data": {"code": code, "message": message}}` 빌더."""
+    """통합 envelope 4-key 실패 응답: {success:false, data:null, message, error:<CODE>}."""
     return JSONResponse(
         status_code=status_code,
         content={
             "success": False,
-            "data": {"code": code, "message": message},
+            "data": None,
+            "message": message,
+            "error": code,
         },
     )
 

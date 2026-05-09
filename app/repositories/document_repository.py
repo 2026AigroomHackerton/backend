@@ -57,7 +57,11 @@ def _connect() -> Iterator[sqlite3.Connection]:
 # ---------------------------------------------------------------------------
 # 조회 쿼리
 # ---------------------------------------------------------------------------
-def list_active_documents_by_user(user_id: int) -> list[dict]:
+def list_active_documents_by_user(
+    user_id: int,
+    folder_id: int | None = None,
+    source_type: str | None = None,
+) -> list[dict]:
     """
     특정 사용자의 활성(soft-delete 되지 않은) 문서 목록을 created_at 내림차순으로 반환한다.
 
@@ -65,27 +69,34 @@ def list_active_documents_by_user(user_id: int) -> list[dict]:
 
     Args:
         user_id: documents.user_id 와 매칭할 사용자 식별자.
+        folder_id: 일치 필터. None 이면 미적용.
+        source_type: 일치 필터. None 이면 미적용.
 
     Returns:
         sqlite3.Row 를 dict 로 변환한 리스트.
-        각 dict 는 documents 테이블의 모든 컬럼을 그대로 담고 있다.
-        (응답 필드 매핑/필터링은 service 계층의 책임)
     """
+    # 동적 WHERE 절 — 필터가 None 이 아닐 때만 조건 + 파라미터 추가.
+    where_clauses = ["user_id = ?", "deleted_at IS NULL"]
+    params: list = [user_id]
+    if folder_id is not None:
+        where_clauses.append("folder_id = ?")
+        params.append(folder_id)
+    if source_type is not None:
+        where_clauses.append("source_type = ?")
+        params.append(source_type)
+
+    sql = (
+        "SELECT id, user_id, original_filename, stored_filename, "
+        "       file_path, file_extension, file_size, content_type, "
+        "       title, source_type, parse_status, folder_id, "
+        "       created_at, updated_at, deleted_at "
+        "FROM documents "
+        "WHERE " + " AND ".join(where_clauses) + " "
+        "ORDER BY created_at DESC, id DESC"
+    )
+
     with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                id, user_id, original_filename, stored_filename,
-                file_path, file_extension, file_size, content_type,
-                title, source_type, parse_status, folder_id,
-                created_at, updated_at, deleted_at
-            FROM documents
-            WHERE user_id = ?
-              AND deleted_at IS NULL
-            ORDER BY created_at DESC, id DESC
-            """,
-            (user_id,),
-        ).fetchall()
+        rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -338,6 +349,53 @@ def insert_document_version(
         # 위와 같은 이유로 assert 후 반환 (Pylance 타입 narrowing).
         assert cursor.lastrowid is not None, "INSERT 직후 lastrowid 는 항상 존재해야 합니다."
         return cursor.lastrowid
+
+
+def list_document_versions(document_id: int) -> list[dict]:
+    """
+    document_versions 테이블에서 해당 문서의 모든 버전 이력을 version_no 내림차순으로 반환한다.
+
+    Args:
+        document_id: documents.id
+
+    Returns:
+        각 버전의 dict 리스트. 컬럼: id, document_id, version_no, text_snapshot,
+        created_by, created_at. 이력 없으면 빈 리스트.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, document_id, version_no, text_snapshot, created_by, created_at
+            FROM document_versions
+            WHERE document_id = ?
+            ORDER BY version_no DESC, id DESC
+            """,
+            (document_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_document_text_record(document_id: int) -> Optional[dict]:
+    """
+    document_texts 의 최신(text_version 최대) 행을 dict 로 반환.
+
+    Returns:
+        해당 행이 있으면 dict (id, document_id, extracted_text, cleaned_text,
+        summary, keywords, text_version, updated_at), 없으면 None.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, document_id, extracted_text, cleaned_text,
+                   summary, keywords, text_version, updated_at
+            FROM document_texts
+            WHERE document_id = ?
+            ORDER BY text_version DESC, id DESC
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
 
 def update_document_updated_at(document_id: int, updated_at: str) -> None:
