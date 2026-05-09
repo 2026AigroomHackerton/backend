@@ -1,3 +1,4 @@
+# [백엔드2 담당] 수정 허용 파일 - feature/backend-ocr-voice-storage 브랜치
 """OCR API Router.
 
 엔드포인트:
@@ -24,10 +25,14 @@ from typing import Any
 #  - status: HTTP 상태 코드 상수 모음 (예: status.HTTP_200_OK).
 from fastapi import APIRouter, File, Form, UploadFile, status
 
-# 비즈니스 로직 모듈을 모듈 단위로 import.
-# (함수 단위로 import 하지 않는 이유: 추후 함수가 늘어나도 import 줄을 건드릴 필요가 없고,
-#  ocr_service.extract_text_from_image 처럼 호출 시 어느 모듈 함수인지가 분명해진다.)
-from app.services import ocr_service
+# 비즈니스 로직은 클래스 기반 서비스(OCRService)로 분리.
+# 모듈-수준 싱글톤 인스턴스(`ocr_service`)를 만들어 두면 호출 사이트의 표기는
+# `ocr_service.extract_text_with_ai(...)` 그대로 유지되어 가독성이 좋다.
+from app.services.ocr_service import OCRService
+
+# 싱글톤 인스턴스. 상태가 없는 stateless 서비스이므로 모듈 수준에서 한 번 만든다.
+# 추후 의존성(예: 외부 클라이언트 주입) 이 필요하면 FastAPI Depends 로 교체.
+ocr_service = OCRService()
 
 
 # -----------------------------------------------------------------------------
@@ -35,7 +40,7 @@ from app.services import ocr_service
 # -----------------------------------------------------------------------------
 # prefix="/api/ocr": 이 라우터에 속한 모든 엔드포인트가 /api/ocr 로 시작.
 # tags=["ocr"]    : Swagger 문서(/docs)에서 "ocr" 그룹으로 묶여 표시됨.
-router = APIRouter(prefix="/api/ocr", tags=["ocr"])
+router = APIRouter(prefix="/api/ocr", tags=["OCR"])
 
 
 # -----------------------------------------------------------------------------

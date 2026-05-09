@@ -1,3 +1,4 @@
+# [백엔드2 담당] 수정 허용 파일 - feature/backend-ocr-voice-storage 브랜치
 # =============================================================================
 # voice.py  (app/routers/voice.py)
 # -----------------------------------------------------------------------------
@@ -27,13 +28,18 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 # 동일 패키지의 서비스 계층을 import. 라우터는 직접 로직을 짜지 않고
-# voice_service.* 함수들을 호출만 한다 (얇은 라우터 + 두꺼운 서비스 패턴).
-from app.services import voice_service
+# VoiceService 인스턴스의 메서드를 호출만 한다 (얇은 라우터 + 두꺼운 서비스 패턴).
+from app.services.voice_service import VoiceService
+
+# 모듈-수준 싱글톤 인스턴스. stateless Mock 서비스이므로 한 번 만들어 재사용.
+# 변수명을 `voice_service` 로 두어 호출 사이트(`voice_service.create_voice_command(...)`)는
+# 함수 기반 시절과 동일하게 유지되어 라우터 로직 수정 폭을 최소화한다.
+voice_service = VoiceService()
 
 
 # 이 라우터의 모든 엔드포인트는 `/api/voice` 접두사 아래에 모인다.
 # tags=["voice"]는 자동 생성되는 OpenAPI 문서(/docs)에서 그룹 이름으로 표시된다.
-router = APIRouter(prefix="/api/voice", tags=["voice"])
+router = APIRouter(prefix="/api/voice", tags=["Voice"])
 
 
 # -----------------------------------------------------------------------------

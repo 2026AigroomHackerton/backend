@@ -1,3 +1,4 @@
+# [백엔드2 담당] 수정 허용 파일 - feature/backend-ocr-voice-storage 브랜치
 """External Storage Router.
 
 외부 저장소(Google Drive, Notion 등) 연결 상태를 노출하는 Mock API.
@@ -13,9 +14,13 @@ from typing import Any
 # FastAPI 의 라우터를 만들기 위한 클래스. main.py 에서 include_router 로 등록된다.
 from fastapi import APIRouter
 
-# 비즈니스 로직은 services 레이어로 분리한다.
+# 비즈니스 로직은 클래스 기반 서비스(StorageService)로 분리한다.
 # 라우터는 "HTTP 입출력 변환" 만 담당하고, 실제 데이터 가공/하드코딩은 service 가 책임진다.
-from app.services import storage_service
+from app.services.storage_service import StorageService
+
+# 모듈-수준 싱글톤 인스턴스. stateless Mock 서비스이므로 한 번 만들어 재사용.
+# 변수명을 `storage_service` 로 두어 호출 사이트는 함수 기반 시절과 동일하게 유지.
+storage_service = StorageService()
 
 # ─────────────────────────────────────────────────────────────────────
 # APIRouter 설정.
@@ -24,7 +29,7 @@ from app.services import storage_service
 #   (다른 도메인 라우터들과 네임스페이스 충돌을 막기 위해 /api/<도메인> 규칙을 따름)
 # - tags=["storage"]: Swagger UI(/docs) 에서 엔드포인트들을 "storage" 그룹으로 묶는다.
 # ─────────────────────────────────────────────────────────────────────
-router = APIRouter(prefix="/api/storage", tags=["storage"])
+router = APIRouter(prefix="/api/storage", tags=["Storage"])
 
 
 # GET /api/storage/providers

@@ -1,8 +1,13 @@
-"""External Storage Mock Service.
+# [백엔드2 담당] 수정 허용 파일 - feature/backend-ocr-voice-storage 브랜치
+"""External Storage Service (Class-based).
 
 Google Drive, Notion 등 외부 저장소 연동의 뼈대 단계.
 실제 OAuth/연동 코드는 포함하지 않으며, 하드코딩된 provider 목록만 반환한다.
-추후 실제 연동 시 이 모듈에서 각 provider 의 status 와 메타데이터를 갱신한다.
+추후 실제 연동 시 이 클래스의 메서드만 갈아끼우면 된다.
+
+[설계 메모]
+- 클래스 기반(StorageService)로 작성. 라우터는 모듈-수준 싱글톤 인스턴스를 사용한다.
+- 추후 OAuth 토큰 저장소 등 의존성이 생기면 __init__(self, token_store) 형태로 확장.
 """
 
 # Python 3.10+ 의 PEP 604 스타일 타입 힌트(`list[dict]` 등)를 런타임 평가가 아닌
@@ -13,10 +18,11 @@ from __future__ import annotations
 # (provider 항목에 향후 문자열/숫자/리스트 등 다양한 메타데이터가 들어갈 수 있음)
 from typing import Any
 
+
 # ─────────────────────────────────────────────────────────────────────
-# 외부 저장소 provider 더미 목록.
+# 외부 저장소 provider 더미 목록 (모듈 수준 — 클래스 인스턴스 간 공유).
 #
-# - 모듈 private 상수(`_` prefix)로 두어 외부에서는 `list_providers()` 함수만 쓰도록 강제.
+# - 모듈 private 상수(`_` prefix)로 두어 외부에서는 StorageService 메서드만 쓰도록 강제.
 # - status 값은 현재 단계에서는 모두 "coming_soon" 으로 고정.
 #   향후 실제 OAuth 연동이 붙으면 "connected" / "disconnected" / "error" 등으로 확장 예정.
 # - provider 식별자(snake_case) 는 프론트엔드/문서와 합의된 키로 사용한다.
@@ -27,14 +33,28 @@ _PROVIDERS: list[dict[str, Any]] = [
 ]
 
 
-def list_providers() -> list[dict[str, Any]]:
-    """외부 저장소 provider 의 연결 상태 목록을 반환한다.
+# =============================================================================
+# StorageService — 외부 저장소 연동 비즈니스 로직 클래스
+# =============================================================================
+class StorageService:
+    """외부 저장소 provider 정보를 제공하는 서비스 클래스.
 
-    Returns:
-        provider 식별자와 status 를 담은 dict 의 리스트.
+    제공 메서드:
+        - list_providers : provider 식별자 + 연결 상태 목록 반환.
+
+    추후 실제 OAuth 연동 시:
+        - 토큰 저장/갱신 로직, 각 provider 의 status 동기화 로직이 이 클래스에 들어옴.
+        - 라우터는 영향 받지 않도록 메서드 시그니처를 유지한다.
     """
-    # 호출자가 반환된 리스트/딕셔너리를 변경해도 모듈 내부 상수(_PROVIDERS) 가
-    # 오염되지 않도록 각 dict 를 얕게 복사해서 새 리스트를 만든다.
-    # (현재는 1-depth dict 라 dict(item) 만으로 충분하지만, 추후 nested 구조가 생기면
-    # copy.deepcopy 로 교체해야 함.)
-    return [dict(item) for item in _PROVIDERS]
+
+    def list_providers(self) -> list[dict[str, Any]]:
+        """외부 저장소 provider 의 연결 상태 목록을 반환한다.
+
+        Returns:
+            provider 식별자와 status 를 담은 dict 의 리스트.
+        """
+        # 호출자가 반환된 리스트/딕셔너리를 변경해도 모듈 내부 상수(_PROVIDERS) 가
+        # 오염되지 않도록 각 dict 를 얕게 복사해서 새 리스트를 만든다.
+        # (현재는 1-depth dict 라 dict(item) 만으로 충분하지만, 추후 nested 구조가 생기면
+        # copy.deepcopy 로 교체해야 함.)
+        return [dict(item) for item in _PROVIDERS]
