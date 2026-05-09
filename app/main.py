@@ -1,33 +1,59 @@
+"""
+FastAPI 앱 진입점.
+
+서버 부팅 시 이 모듈이 가장 먼저 실행되어 라우터들을 한곳에 모은다.
+실제 비즈니스 로직은 각 라우터/서비스/리포지토리 모듈에 분리되어 있고,
+본 파일은 다음만 책임진다.
+    - FastAPI 앱 인스턴스 생성 (title/version)
+    - 헬스체크용 루트 엔드포인트
+    - 라우터 등록 (include_router)
+
+라우터 등록 정책:
+    [백엔드 1 도메인]
+      - documents 라우터: 문서 업로드/조회/수정 API (`/api/documents/...`)
+      - archive   라우터: 보관함 통합 조회 API (`/api/archive`)
+    [백엔드 2 도메인]
+      - ocr     라우터: 이미지 OCR API (`/api/ocr/...`)
+      - voice   라우터: 음성/텍스트 명령 API (`/api/voice/...`)
+      - storage 라우터: 외부 저장소/임포트 API (`/api/storage/...`, `/api/connectors/...`)
+      - ai      라우터: AI 문서 수정 API (`/api/ai/...`)
+"""
+
 from fastapi import FastAPI
 
+# 백엔드 2 라우터 — 모듈을 alias 로 import 한 뒤 .router 속성으로 접근.
 from app.routers import ocr as ocr_router
 from app.routers import storage as storage_router
-# 백엔드 2: 음성/텍스트 명령 라우터 (POST /api/voice/commands, GET /api/voice/commands).
-# ocr/storage 와 동일하게 모듈을 import 한 뒤 .router 속성으로 접근.
 from app.routers import voice as voice_router
-# 백엔드 2: AI 문서 수정 라우터 (POST /api/ai/command-edit). 모듈 자체를
-# import 한 뒤 .router 속성으로 접근하는 패턴(팀 컨벤션, 위 ocr/storage 동일).
 from app.routers import ai as ai_router
-# [통합 테스트 임시] 백엔드 1: documents 라우터.
-# 본 등록 라인은 integration/sprint-1 (로컬 테스트 전용 폐기 브랜치) 에서만 추가됐다.
-# 정식으로는 백엔드 1 의 feature/backend-documents 측 main.py 에서 등록되어야 함.
-from app.routers import documents as documents_router
+
+# 백엔드 1 라우터 — 모듈을 직접 import (alias 없이) .router 로 접근.
+from app.routers import archive, documents
+
 
 app = FastAPI(
     title="AI Mobile Document Assistant API",
     version="0.1.0",
 )
 
+# ---------------------------------------------------------------------------
+# 라우터 등록
+# ---------------------------------------------------------------------------
+# 각 라우터 모듈은 자체 prefix(/api/documents, /api/archive, /api/ocr 등) 를
+# 갖고 있으므로 여기서는 prefix 를 따로 부여하지 않고 그대로 include 한다.
+
+# 백엔드 2: OCR / 외부저장소 / 음성 / AI
 app.include_router(ocr_router.router)
 app.include_router(storage_router.router)
-# 백엔드 2: voice 라우터 등록. 호출 후 /api/voice/* 엔드포인트가 노출된다.
 app.include_router(voice_router.router)
-# 백엔드 2: AI 라우터 등록. 호출 후 /api/ai/* 엔드포인트가 노출된다.
 app.include_router(ai_router.router)
-# [통합 테스트 임시] documents 라우터 등록. /api/documents/* 노출.
-app.include_router(documents_router.router)
+
+# 백엔드 1: 문서 / 보관함
+app.include_router(documents.router)
+app.include_router(archive.router)
 
 
 @app.get("/")
 def read_root() -> dict[str, str]:
+    """헬스체크용 루트 엔드포인트 — 서버 기동 여부 확인용."""
     return {"status": "ok", "service": "AI Mobile Document Assistant API"}
