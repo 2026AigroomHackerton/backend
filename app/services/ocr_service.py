@@ -318,6 +318,117 @@ class OcrService:
         return f"ocr_{uuid.uuid4().hex[:8]}"
 
     # =========================================================================
+    # 5) create_document_from_ocr — OCR 결과로 documents + document_texts INSERT
+    # =========================================================================
+    def create_document_from_ocr(
+        self,
+        db: Any,
+        image_path: str,
+        extracted_text: str,
+        original_filename: str | None,
+        content_type: str | None,
+    ) -> int | None:
+        """OCR 결과를 documents + document_texts 두 테이블에 INSERT.
+
+        라우터에서 `create_document=True` 일 때만 호출된다.
+
+        Args:
+            db: SQLAlchemy Session (라우터의 Depends(get_db) 로 주입).
+                None 이면 INSERT 를 건너뛰고 None 반환 (graceful 폴백).
+            image_path: save_image 가 반환한 디스크 경로 (file_path 컬럼에 저장).
+            extracted_text: extract_text_from_image 결과 본문.
+            original_filename: 클라이언트가 보낸 파일명 (원본).
+            content_type: image/png 등 MIME.
+
+        Returns:
+            생성된 documents.id. db=None 이거나 INSERT 실패 시 None.
+
+        Notes:
+            - documents 테이블의 NOT NULL 컬럼을 모두 채워야 IntegrityError 회피.
+            - source_type='ocr' 로 표시해 storage mock-import 와 구분.
+            - document_texts.text_version=1 로 시작.
+            - 어느 단계에서든 실패하면 rollback 후 None 반환 (응답은 OCR 결과만 줌).
+        """
+        if db is None:
+            return None
+
+        try:
+            # raw SQL 로 INSERT (storage_service 의 동일 패턴과 일관). ORM 모델을
+            # 직접 import 하지 않는 이유: 통합 단계에서 모델 구조가 바뀌면 다른
+            # 서비스도 영향받을 수 있어, 명세 컬럼명에 직접 의존시키는 게 안전.
+            from sqlalchemy import text as _sql_text  # type: ignore
+            import uuid as _uuid
+
+            # 디스크 메타데이터 (가능하면 실제 값, 안 되면 폴백).
+            image_p = Path(image_path)
+            try:
+                file_size_bytes = image_p.stat().st_size
+            except OSError:
+                file_size_bytes = len(extracted_text.encode("utf-8"))
+
+            ext = image_p.suffix.lower() or ".bin"
+            stored = image_p.name or f"ocr_{_uuid.uuid4().hex[:12]}{ext}"
+            now_iso = datetime.utcnow().isoformat()
+            title = (original_filename or "OCR 추출 문서").rsplit(".", 1)[0]
+
+            # ----- documents INSERT -----------------------------------------
+            doc_result = db.execute(
+                _sql_text(
+                    "INSERT INTO documents ("
+                    " user_id, original_filename, stored_filename, file_path,"
+                    " file_extension, file_size, content_type,"
+                    " title, source_type, file_type, parse_status,"
+                    " owner_type, owner_id, created_at"
+                    ") VALUES ("
+                    " 1, :original_filename, :stored_filename, :file_path,"
+                    " :ext, :file_size, :content_type,"
+                    " :title, 'ocr', :file_type, 'done',"
+                    " 'user', 1, :created_at"
+                    ")"
+                ),
+                {
+                    "original_filename": original_filename or "ocr_image",
+                    "stored_filename": stored,
+                    "file_path": image_path,
+                    "ext": ext,
+                    "file_size": file_size_bytes,
+                    "content_type": content_type,
+                    "title": title,
+                    # file_type 은 명세 컬럼. 확장자 앞의 점 제거해 'png' 형태로 저장.
+                    "file_type": ext.lstrip("."),
+                    "created_at": now_iso,
+                },
+            )
+            new_document_id = doc_result.lastrowid
+            if new_document_id is None:
+                raise RuntimeError("documents INSERT 후 lastrowid 가 None")
+
+            # ----- document_texts INSERT ------------------------------------
+            db.execute(
+                _sql_text(
+                    "INSERT INTO document_texts "
+                    "(document_id, extracted_text, text_version, updated_at) "
+                    "VALUES (:document_id, :extracted_text, 1, :updated_at)"
+                ),
+                {
+                    "document_id": new_document_id,
+                    "extracted_text": extracted_text,
+                    "updated_at": now_iso,
+                },
+            )
+
+            db.commit()
+            return int(new_document_id)
+
+        except Exception as exc:  # noqa: BLE001 — INSERT 실패해도 OCR 응답은 살림
+            logger.warning("OCR → documents INSERT 실패 → document_id=None 폴백: %s", exc)
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001 — rollback 자체 실패도 무시
+                pass
+            return None
+
+    # =========================================================================
     # 보조: extract 결과를 in-memory store 에 등록 (GET/confirm 동작용)
     # =========================================================================
     def remember(

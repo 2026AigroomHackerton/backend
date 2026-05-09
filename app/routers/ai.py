@@ -22,21 +22,29 @@ from __future__ import annotations
 from typing import Any
 
 # APIRouter: FastAPI에서 라우트를 모듈별로 분리할 때 쓰는 미니 라우터.
+# Depends: DB 세션 등 의존성을 주입받기 위한 헬퍼.
 # main.py에서 include_router(...)로 본 라우터를 앱에 합친다.
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 # BaseModel: Pydantic의 데이터 검증 클래스. 요청/응답 스키마를 선언하면
 # FastAPI가 자동으로 JSON 파싱/검증/OpenAPI 문서 생성을 처리한다.
 # Field: 각 필드에 description, 기본값, 제약(min_length 등)을 부여.
 from pydantic import BaseModel, Field
 
-# 서비스 계층의 Mock 함수를 가져온다. 라우터는 직접 응답 데이터를 만들지
-# 않고, 항상 서비스 함수를 거쳐 데이터를 받아온다 (관심사 분리).
+# 서비스 계층의 함수. 라우터는 직접 응답 데이터를 만들지 않고, 항상 서비스
+# 함수를 거쳐 데이터를 받아온다 (관심사 분리).
 # generate_edit_plan: 공개 진입점.
-#   - OPENAI_API_KEY 가 있으면 실제 OpenAI 호출
+#   - OPENAI_API_KEY 가 있으면 실제 OpenAI 호출 (db 주입 시 본문도 함께 prompt 에 포함)
 #   - 키가 없거나 호출 실패 시 자동으로 generate_mock_edit_plan 으로 폴백
-# 라우터는 키 유무를 신경 쓰지 않고 항상 같은 함수 하나만 호출한다.
 from app.services.ai_service import generate_edit_plan
+
+# DB 의존성 — storage.py / ocr.py 와 동일한 lazy import 폴백.
+try:
+    from app.database import get_db  # type: ignore
+except ImportError:  # pragma: no cover
+    def get_db():  # noqa: D401 — 더미 generator
+        """더미 get_db. None 을 yield 해 라우터가 db=None 으로 호출되게 한다."""
+        yield None
 
 
 # 라우터 인스턴스.
@@ -91,28 +99,32 @@ class CommandEditResponse(BaseModel):
         "키가 없거나 호출이 실패하면 동일한 응답 스키마의 mock 결과로 자동 폴백합니다."
     ),
 )
-def command_edit(req: CommandEditRequest) -> CommandEditResponse:
+def command_edit(
+    req: CommandEditRequest,
+    db=Depends(get_db),
+) -> CommandEditResponse:
     """사용자 명령을 받아 AI 가 만든 수정 계획을 돌려준다.
 
     [흐름]
       1) FastAPI 가 요청 바디 JSON 을 자동으로 CommandEditRequest 로 변환.
-      2) 서비스 계층(generate_edit_plan) 에 위임해 EditOperation dict 생성.
-         - OPENAI_API_KEY 가 있으면 실제 OpenAI 호출.
-         - 키 부재 / 호출 실패 시 generate_mock_edit_plan 으로 자동 폴백.
-      3) 공통 응답 포맷({success, data}) 으로 감싸서 반환.
+      2) Depends(get_db) 로 SQLAlchemy 세션 주입.
+      3) 서비스 계층(generate_edit_plan) 에 위임:
+         - 서비스가 db 와 document_id 로 document_texts 본문 조회.
+         - 본문이 prompt 에 포함되어 OpenAI 가 실제 텍스트를 보고 응답.
+         - 키 부재 / 호출 실패 / 본문 부재 시 mock 폴백.
+      4) 공통 응답 포맷({success, data}) 으로 감싸서 반환.
 
     [예외 처리]
-      - generate_edit_plan 내부에서 OpenAI 예외를 잡아 mock 폴백 처리하므로,
-        현 라우터에서 별도 try/except 는 두지 않는다.
-      - 폴백조차 실패하는 케이스가 발견되면 HTTPException(500/503) 매핑을 추가한다.
+      - generate_edit_plan 내부에서 모든 외부 호출 예외를 잡아 폴백 처리.
+      - 라우터 단에서 별도 try/except 두지 않는다.
     """
-    # 서비스 함수 호출. 키워드 인자로 명시 전달하여 가독성 + 실수 방지.
-    # (위치 인자로 넘기면 시그니처가 바뀌었을 때 조용히 잘못 매핑될 수 있음)
-    # generate_edit_plan 내부에서 OpenAI ↔ mock 자동 분기/폴백을 처리한다.
+    # 서비스 함수 호출. db 까지 전달하여 본문 조회까지 수행하게 한다.
+    # 키 / 세션 / 본문 어느 하나라도 누락되면 서비스가 graceful 폴백.
     plan = generate_edit_plan(
         document_id=req.document_id,
         command_text=req.command_text,
         scope=req.scope,
+        db=db,
     )
 
     # 서비스가 돌려준 dict를 공통 응답 포맷으로 래핑하여 반환.
